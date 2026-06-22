@@ -45,6 +45,7 @@ data class AutoBookUiState(
     val logs: List<AutoBookLogEntry> = emptyList(),
     val notificationRules: List<NotificationRuleEntity> = emptyList(),
     val aiStats: String = "",
+    val aboutInfo: com.tao.autobook.data.AutoBookRepository.AboutInfo = com.tao.autobook.data.AutoBookRepository.AboutInfo(),
     val syncFeedback: String = "",
     val monthExpenseCents: Long = 0L,
     val monthIncomeCents: Long = 0L,
@@ -64,6 +65,7 @@ class AutoBookViewModel(private val repository: AutoBookRepository) : ViewModel(
     private val notificationRules = MutableStateFlow<List<NotificationRuleEntity>>(emptyList())
     private val aiStatsFlow = MutableStateFlow("")
     val syncFeedbackFlow = MutableStateFlow("")
+    private val aboutInfoFlow = MutableStateFlow(com.tao.autobook.data.AutoBookRepository.AboutInfo())
     val customKeywords: StateFlow<List<String>> = MutableStateFlow(repository.getWhitelist())
     private val _customKeywords = customKeywords as MutableStateFlow<List<String>>
     private val monthExpenseFlow = MutableStateFlow(0L)
@@ -97,8 +99,8 @@ class AutoBookViewModel(private val repository: AutoBookRepository) : ViewModel(
     private val stateWithAi = combine(baseWithRules, repository.aiSettings, aiModels, voucherPreview, logs) { base, ai, models, preview, logList ->
         base.copy(aiSettings = ai, aiModels = models, voucherPreviewTransactionId = preview?.first, voucherPreviewBitmaps = preview?.second ?: emptyList(), logs = logList)
     }
-    private val stateWithSync = combine(stateWithAi, aiStatsFlow, syncFeedbackFlow) { base, statsStr, syncFb ->
-        base.copy(aiStats = statsStr, syncFeedback = syncFb)
+    private val stateWithSync = combine(stateWithAi, aiStatsFlow, syncFeedbackFlow, aboutInfoFlow) { base, statsStr, syncFb, about ->
+        base.copy(aiStats = statsStr, syncFeedback = syncFb, aboutInfo = about)
     }
     private val stateWithStats = combine(stateWithSync, monthExpenseFlow, monthIncomeFlow, todayExpenseFlow) { base, mExp, mInc, tExp ->
         base.copy(monthExpenseCents = mExp, monthIncomeCents = mInc, todayExpenseCents = tExp)
@@ -109,6 +111,7 @@ class AutoBookViewModel(private val repository: AutoBookRepository) : ViewModel(
 
     init {
         viewModelScope.launch { repository.observeNotificationRules().collect { notificationRules.value = it } }
+        fetchAboutInfo()
         // 月度/日度统计：每30秒刷新一次（数据库聚合查询）
         viewModelScope.launch {
             while (true) {
@@ -497,6 +500,12 @@ class AutoBookViewModel(private val repository: AutoBookRepository) : ViewModel(
     fun saveCustomPrompt(type: String, prompt: String) {
         repository.saveCustomPrompt(type, prompt)
         message.value = "AI提示词已保存"
+    }
+
+    fun fetchAboutInfo() {
+        viewModelScope.launch {
+            aboutInfoFlow.value = repository.fetchAboutInfo()
+        }
     }
 
     fun refreshAiStats() {

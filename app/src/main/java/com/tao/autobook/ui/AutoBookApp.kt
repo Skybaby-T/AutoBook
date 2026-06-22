@@ -1266,28 +1266,49 @@ private fun SettingsScreen(
         item { SyncSettingsCard(syncConfig, onSyncConfig, onSyncPush, onSyncPull) }
         item { SectionTitle("关于") }
         item {
+            val about = state.aboutInfo
             Card(colors = CardDefaults.cardColors(containerColor = CardWhite), shape = RoundedCornerShape(14.dp), modifier = Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("SKY自动记账 v1.0.4", color = Ink, fontWeight = FontWeight.Bold)
-                    Text("自动识别支付通知、截图补记、AI智能分类。", color = Muted, style = MaterialTheme.typography.bodySmall)
-                    val ctx = LocalContext.current
-                    val url = "https://taxi.ssssvip.cc.cd"
-                    Text(
-                        "官网：$url",
-                        color = Blue,
-                        style = MaterialTheme.typography.bodySmall,
-                        modifier = Modifier.combinedClickable(
-                            onClick = {
-                                ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
-                            },
-                            onLongClick = {
-                                val cm = ctx.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-                                cm.setPrimaryClip(android.content.ClipData.newPlainText("url", url))
-                                android.widget.Toast.makeText(ctx, "链接已复制", android.widget.Toast.LENGTH_SHORT).show()
-                            }
+                    Text("${about.title} v1.0.4", color = Ink, fontWeight = FontWeight.Bold)
+                    if (about.description.isNotBlank()) {
+                        Text(about.description, color = Muted, style = MaterialTheme.typography.bodySmall)
+                    }
+                    if (about.website.isNotBlank()) {
+                        val ctx = LocalContext.current
+                        Text(
+                            "官网：${about.website}",
+                            color = Blue,
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.combinedClickable(
+                                onClick = { ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(about.website))) },
+                                onLongClick = {
+                                    val cm = ctx.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                    cm.setPrimaryClip(android.content.ClipData.newPlainText("url", about.website))
+                                    android.widget.Toast.makeText(ctx, "链接已复制", android.widget.Toast.LENGTH_SHORT).show()
+                                }
+                            )
                         )
-                    )
-                    Text("软件更新请访问上述地址下载最新版本。", color = Muted, style = MaterialTheme.typography.bodySmall)
+                    }
+                    if (about.recommendations.isNotEmpty()) {
+                        Spacer(Modifier.height(4.dp))
+                        Text("AI记账助手推荐", color = Ink, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodySmall)
+                        about.recommendations.forEach { rec ->
+                            val ctx = LocalContext.current
+                            Row(
+                                Modifier.fillMaxWidth().clickable {
+                                    ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(rec.url)))
+                                }.padding(vertical = 2.dp),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text("•", color = Blue, fontWeight = FontWeight.Bold)
+                                Column {
+                                    Text(rec.name, color = Blue, fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.bodySmall)
+                                    Text(rec.desc, color = Muted, style = MaterialTheme.typography.labelSmall)
+                                }
+                            }
+                        }
+                    }
                 }
             }
         }

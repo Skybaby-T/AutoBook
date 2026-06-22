@@ -1443,6 +1443,42 @@ $chatHistory
         backup
     }
 
+    // ====== 远程关于信息 ======
+    data class AboutInfo(
+        val title: String = "SKY自动记账",
+        val description: String = "",
+        val website: String = "",
+        val recommendations: List<Recommendation> = emptyList()
+    )
+    data class Recommendation(val name: String = "", val url: String = "", val desc: String = "")
+
+    suspend fun fetchAboutInfo(): AboutInfo = withContext(Dispatchers.IO) {
+        try {
+            val url = java.net.URL("https://taxi.ssssvip.cc.cd/static/about.json")
+            val conn = url.openConnection() as java.net.HttpURLConnection
+            conn.connectTimeout = 10000
+            conn.readTimeout = 10000
+            val text = conn.inputStream.bufferedReader().readText()
+            conn.disconnect()
+            val json = org.json.JSONObject(text)
+            val recs = mutableListOf<Recommendation>()
+            json.optJSONArray("recommendations")?.let { arr ->
+                for (i in 0 until arr.length()) {
+                    val obj = arr.getJSONObject(i)
+                    recs.add(Recommendation(obj.optString("name"), obj.optString("url"), obj.optString("desc")))
+                }
+            }
+            AboutInfo(
+                title = json.optString("title", "SKY自动记账"),
+                description = json.optString("description", ""),
+                website = json.optString("website", ""),
+                recommendations = recs
+            )
+        } catch (_: Exception) {
+            AboutInfo()
+        }
+    }
+
     // ====== 云同步 ======
     private val SYNC_URL = "https://taxi.ssssvip.cc.cd/api/sync"
     private val SYNC_PREFS = "autobook_sync"
