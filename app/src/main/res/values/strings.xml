@@ -1,0 +1,16 @@
+<resources>
+    <string name="app_name">SKY自动记账</string>
+    <string name="accessibility_description">用于在支付完成页面辅助识别账单，并在系统允许时自动截图。不会点击、付款或转账。</string>
+    <string name="tab_ledger">记账</string>
+    <string name="tab_entry">记一笔</string>
+    <string name="tab_report">报表</string>
+    <string name="tab_settings">设置</string>
+    <string name="confirm_delete">确认删除</string>
+    <string name="confirm_delete_msg">确定要删除这笔账单记录吗？此操作不可撤销。</string>
+    <string name="cancel">取消</string>
+    <string name="delete">删除</string>
+    <string name="save">保存</string>
+    <string name="hint">提示</string>
+    <string name="ok">知道了</string>
+    <string name="loading">处理中…</string>
+</resources>

@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged|typeWindowContentChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagReportViewIds|flagRetrieveInteractiveWindows"
+    android:canRetrieveWindowContent="true"
+    android:canTakeScreenshot="true"
+    android:description="@string/accessibility_description"
+    android:notificationTimeout="800"
+    android:packageNames="com.tencent.mm,com.eg.android.AlipayGphone,com.unionpay,com.unionpay.tsmservice,com.jingdong.app.mall,com.jd.jrapp,com.ss.android.ugc.aweme,com.taobao.taobao,com.tmall.wireless,com.xunmeng.pinduoduo,com.sankuai.meituan,com.meituan.android.generalcategories" />
