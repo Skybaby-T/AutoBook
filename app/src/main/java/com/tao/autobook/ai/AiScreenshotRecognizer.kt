@@ -27,6 +27,22 @@ class AiScreenshotRecognizer {
             val request = buildRequest(config.model, imageBase64, ocrText)
             val response = postJson(config, request)
             parseResponse(response)
+        }.onFailure {
+            android.util.Log.w("AiRecognizer", "Screenshot recognize failed: ${it.javaClass.simpleName}: ${it.message?.take(160)}")
+        }
+    }
+
+    suspend fun recognizeRaw(bitmap: Bitmap, config: AiRecognitionConfig): Result<AiParsedPayment> = withContext(Dispatchers.IO) {
+        runCatching {
+            require(config.configured) { "AI 截图识别未配置完整" }
+            val output = ByteArrayOutputStream()
+            bitmap.compress(Bitmap.CompressFormat.PNG, 100, output)
+            val imageBase64 = Base64.encodeToString(output.toByteArray(), Base64.NO_WRAP)
+            val request = buildRequest(config.model, imageBase64, "", "image/png")
+            val response = postJson(config, request)
+            parseResponse(response)
+        }.onFailure {
+            android.util.Log.w("AiRecognizer", "Raw screenshot recognize failed: ${it.javaClass.simpleName}: ${it.message?.take(160)}")
         }
     }
 
@@ -60,6 +76,7 @@ class AiScreenshotRecognizer {
                     .put("content", "只回复 OK")))
                 .put("temperature", 0)
                 .put("max_tokens", 8)
+                .put("thinking", JSONObject().put("type", "disabled"))
             validateChatResponse(postJson(config, request))
         }.map { Unit }
     }
@@ -87,25 +104,40 @@ class AiScreenshotRecognizer {
         }
     }
 
-    private fun buildRequest(model: String, imageBase64: String, ocrText: String): JSONObject {
+    private fun buildRequest(model: String, imageBase64: String, ocrText: String, mimeType: String = "image/jpeg"): JSONObject {
         val prompt = """
-            你是一个中文消费截图记账解析器。请从支付截图中提取一笔最明确的消费记录。
-            只返回 JSON，不要解释，不要 Markdown。
-            JSON 字段：amount(number, 元), merchantName(string), paidAt(string, yyyy-MM-dd HH:mm 或空字符串), paymentApp(string, ALIPAY/WECHAT/UNION_PAY/JD/DOUYIN/TAOBAO/TMALL/PINDUODUO/MEITUAN/UNKNOWN), type(string, EXPENSE/INCOME/OTHER), categoryHint(string), note(string), confidence(number 0-1), reason(string)。
-            如果截图里有多笔记录，优先选择用户点开的那一笔或页面主体最明显的一笔。
-            如果能看到金额，amount 必须填写纯数字元；merchantName 无法确定时填商品名、交易对象或平台名；paidAt 无法确定时留空；note 写适合账单展示的简短备注。
-            如果这是消费、付款、账单或订单截图，且能识别金额，请给 confidence 不低于 0.65，方便自动入账。
-            只有在图片不是消费/付款/账单/订单截图，或看不到金额时，confidence 才低于 0.5。
-            本地 OCR 文本：${ocrText.take(1600)}
-        """.trimIndent()
+                            你是中文消费截图记账解析器。只从“真实支付/账单/订单详情”截图提取一笔账单，只返回JSON。
+                            JSON字段：amount(number元), merchantName(string), paidAt(string yyyy-MM-dd HH:mm 或空字符串), paymentApp(string ALIPAY/WECHAT/UNION_PAY/JD/DOUYIN/TAOBAO/TMALL/PINDUODUO/MEITUAN/UNKNOWN), type(string EXPENSE/INCOME/OTHER), categoryHint(string), note(string), confidence(number 0-1), reason(string), isSpam(boolean)。
+                            规则：
+                            1. isSpam=true（必须拒绝自动入账）：聊天记录、微信/QQ对话气泡页、朋友圈、验证码、广告、物流、评价、邀请、签到、仅“我已经付款了/已付款/好的收到”文字、没有支付成功页/订单页/账单页特征
+                            2. isSpam=false 仅当截图是：支付成功、付款成功、交易成功、订单详情、账单详情、商家转账/收款详情、退款到账，且能看到明确金额
+                            3. categoryHint填分类：餐饮/交通/购物/生活缴费/娱乐/医疗/教育/转账/人情/退款/工资/奖金/理财/其他
+                               - 外卖/骑手/送达/出餐 → 餐饮
+                               - 拼多多/淘宝/天猫/京东商城实物购买 → 购物
+                               - 京东外卖也归餐饮，不要归购物
+                               - 商家转账/福利到账/收款 → 退款或转账（收入）
+                            4. note填商品名/服务名，禁止填购物、餐饮等分类名；聊天截图 note 留空
+                            5. merchantName填商户名/付款方/收款方；聊天截图 merchantName 留空
+                            6. paidAt 时间优先级（非常重要，只填一个）：
+                               ① 下单时间 / 创建时间 / 提交订单时间（最高优先，拼多多/电商订单必须用这个）
+                               ② 支付时间 / 付款时间 / 转账时间
+                               ③ 完成时间 / 成交时间 / 收货时间（最低，禁止优先于下单时间）
+                               页面同时出现多个时间时，绝不要用完成时间顶替下单时间；都没有则用“截图时间”；禁止编造年份
+                            7. paymentApp 优先根据“截图来源应用包名/截图来源支付App”判断：com.jingdong→JD，com.tencent.mm→WECHAT，alipay→ALIPAY，pinduoduo→PINDUODUO，meituan/sankuai→MEITUAN
+                            8. amount 仅提取本次金额；带“+”/收款/到账 → type=INCOME；支出用正数金额、type=EXPENSE
+                            9. 聊天/非支付页：isSpam=true, amount=0, confidence≤0.2；真实账单页 confidence≥0.7
+                            本地OCR与元数据：
+                            ${ocrText.take(1800)}
+                        """.trimIndent()
         val content = JSONArray()
             .put(JSONObject().put("type", "text").put("text", prompt))
-            .put(JSONObject().put("type", "image_url").put("image_url", JSONObject().put("url", "data:image/jpeg;base64,$imageBase64")))
+            .put(JSONObject().put("type", "image_url").put("image_url", JSONObject().put("url", "data:$mimeType;base64,$imageBase64")))
         return JSONObject()
             .put("model", model)
             .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", content)))
             .put("temperature", 0)
             .put("max_tokens", 500)
+            .put("thinking", JSONObject().put("type", "disabled"))
     }
 
     fun buildTextRequestWithPrompt(model: String, rawText: String, customPrompt: String): JSONObject {
@@ -120,39 +152,33 @@ class AiScreenshotRecognizer {
             .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", prompt)))
             .put("temperature", 0)
             .put("max_tokens", 360)
+            .put("thinking", JSONObject().put("type", "disabled"))
     }
 
     private fun buildDefaultNotificationPrompt(rawText: String): String {
         return """你是中文支付通知记账解析器。请从通知标题/正文中提取一笔账单，只返回JSON，不要Markdown。
 字段：amount(number, 元), merchantName(string), paidAt(string, yyyy-MM-dd HH:mm 或空字符串), paymentApp(string, ALIPAY/WECHAT/UNION_PAY/JD/DOUYIN/TAOBAO/TMALL/PINDUODUO/MEITUAN/UNKNOWN), type(string, EXPENSE/INCOME/OTHER), categoryHint(string), note(string), confidence(number 0-1), reason(string), isSpam(boolean)。
-规则：只有真实消费才算有效账单；isSpam=true时amount填0；categoryHint必须是：餐饮/交通/购物/生活缴费/娱乐/医疗/教育/转账/人情/退款/工资/奖金/理财/其他
+重要规则：
+1. 必须返回 isSpam=true：签到、邀请、活动、抽奖、优惠券、广告、营销、贷款、理财、验证码、物流、签收、评价、社保卡、App推送
+2. 必须返回 isSpam=false：支付成功、付款成功、扣款成功、白条消费、退款到账
+3. isSpam=true时amount填0；isSpam=false时amount和merchantName必须填写
+4. categoryHint：餐饮/交通/购物/生活缴费/娱乐/医疗/教育/转账/人情/退款/工资/奖金/理财/其他
+5. 拼多多/淘宝/京东等电商购物归入"购物"类
+6. note填商品名，禁止填购物、餐饮等分类名。无法确定时留空
 通知文本：${rawText.take(1600)}"""
     }
 
     private fun buildTextRequest(model: String, rawText: String): JSONObject {
         val prompt = """
-            你是中文支付通知记账解析器。请从通知标题/正文中提取一笔账单，只返回 JSON，不要 Markdown。
-            字段：amount(number, 元), merchantName(string), paidAt(string, yyyy-MM-dd HH:mm 或空字符串), paymentApp(string, ALIPAY/WECHAT/UNION_PAY/JD/DOUYIN/TAOBAO/TMALL/PINDUODUO/MEITUAN/UNKNOWN), type(string, EXPENSE/INCOME/OTHER), categoryHint(string), note(string), confidence(number 0-1), reason(string), isSpam(boolean)。
-            重要规则：
-            1. 必须返回 isSpam=true 的通知：
-               - 花呗/信用卡月度账单提醒（"花呗账单XXX元"、"点击还款"、"本期账单"）
-               - 广告推送、营销活动、优惠券、红包领取、抽奖
-               - 贷款推广、理财推荐、保险推销
-               - App功能推送、活动通知、版本更新
-               - 签到提醒、打卡提醒、会员续费提醒
-            2. 必须返回 isSpam=false 的通知：
-               - 京东白条消费通知（"白条交易提醒"、"消费X元"）
-               - 支付宝/微信支付成功通知
-               - 任何包含"支付成功""付款成功""购买成功""扣款成功"的通知
-               - 退款到账通知
-            3. isSpam=true 时 amount 填 0，merchantName 填空字符串
-            4. isSpam=false 时 amount 和 merchantName 必须填写
-            5. 区分关键："交易提醒"+"消费X元"=真实消费，"账单提醒"+"待还"=账单
-            3. 退款、退款到账、原路退回必须返回 type=INCOME，categoryHint=退款
-            4. categoryHint 必须是以下之一：餐饮、交通、购物、生活缴费、娱乐、医疗、教育、转账、人情、退款、工资、奖金、理财、其他
-            5. merchantName 必须是真实商户名或商品名，不能是"AI识别消费""未知消费"等无意义值。无法确定时用支付App名。
-            6. 通知文本中的金额可能是待还金额（如"花呗账单1713.48元"），不是实际消费金额，注意区分。
-
+            你是中文支付通知记账解析器。从通知中提取一笔账单，只返回JSON。
+            字段：amount(number元), merchantName(string), paidAt(string yyyy-MM-dd HH:mm), paymentApp(string), type(string EXPENSE/INCOME/OTHER), categoryHint(string), note(string), confidence(number 0-1), reason(string), isSpam(boolean)。
+            规则：
+            1. isSpam=true：签到/邀请/活动/抽奖/优惠券/广告/营销/贷款/验证码/物流/App推送/花呗账单提醒/信用卡账单。此时amount=0, merchantName=""
+            2. isSpam=false：支付成功/付款成功/扣款成功/白条消费/退款到账。此时amount和merchantName必须填写
+            3. merchantName填真实商户名，如：美团外卖、肯德基、滴滴出行。不能填"AI识别消费"
+            4. categoryHint填分类，只能是：餐饮/交通/购物/生活缴费/娱乐/医疗/教育/转账/人情/退款/工资/奖金/理财/其他
+            5. note填商品名，如：咖啡、外卖、洗衣液。禁止填购物、餐饮等分类名，无法确定时留空
+            6. 退款到账/原路退回→type=INCOME, categoryHint=退款
             通知文本：${rawText.take(1600)}
         """".trimIndent()
         return JSONObject()
@@ -160,39 +186,37 @@ class AiScreenshotRecognizer {
             .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", prompt)))
             .put("temperature", 0)
             .put("max_tokens", 360)
+            .put("thinking", JSONObject().put("type", "disabled"))
     }
 
     private fun buildAccessibilityTextRequest(model: String, rawText: String): JSONObject {
         val prompt = """
-            你是中文支付页面记账解析器。以下是从支付成功页面通过无障碍服务提取的文本。
-            请从中提取一笔最明确的消费或退款记录，只返回 JSON，不要 Markdown。
-            字段：amount(number, 元), merchantName(string), paidAt(string, yyyy-MM-dd HH:mm 或空字符串), paymentApp(string, ALIPAY/WECHAT/UNION_PAY/JD/DOUYIN/TAOBAO/TMALL/PINDUODUO/MEITUAN/UNKNOWN), type(string, EXPENSE/INCOME), categoryHint(string), note(string), confidence(number 0-1), reason(string), isSpam(boolean)。
-
-            重要规则：
-            1. 金额提取：优先匹配 ¥ 或 ￥ 后面的数字，如 ¥12.50；也匹配"金额：¥12.50"或"12.50元"格式。取页面中最明显的那个金额。
-            2. 商户提取（重要）：从"付款给""商家""商户""店铺""商品说明""收款方""商品名""交易对方"等字段提取真实商户名称。绝对不能返回"AI识别消费""未知消费"等无意义值。如果页面有商品名，用商品名作为商户。如果完全无法确定，用支付App名（如"微信支付""支付宝"）。注意："回头客""的组合"等可能是商户名或商品名，应如实记录。
-            3. 忽略页面导航栏、底部菜单、广告、推荐内容、"返回""完成"等按钮文字。
-            4. 如果是支付成功/交易成功页面且能看到金额，confidence 不低于 0.65。
-            5. 只有非消费页面（如首页、设置页）或完全看不到金额时，confidence 低于 0.5。
-            6. 退款、退回相关文本返回 type=INCOME，categoryHint=退款。
-            7. isSpam 在以下情况返回 true：页面不是支付相关、是花呗/白条还款页面、是账单提醒页面、是广告页面。
-            8. categoryHint 必须是以下之一：餐饮、交通、购物、生活缴费、娱乐、医疗、教育、转账、人情、退款、工资、奖金、理财、其他
-
-            页面文本：
-            ${rawText.take(3000)}
+            你是中文支付页面记账解析器。从支付成功页面文本中提取一笔消费记录，只返回JSON。
+            字段：amount(number元), merchantName(string), paidAt(string yyyy-MM-dd HH:mm), paymentApp(string), type(string EXPENSE/INCOME), categoryHint(string), note(string), confidence(number 0-1), reason(string), isSpam(boolean)。
+            规则：
+            1. 金额：优先匹配¥/￥后面的数字，如¥12.50。取页面最明显的金额
+            2. 商户名：从"付款给""商家""商品说明""收款方"等字段提取。不能填"AI识别消费"，无法确定时用支付App名
+            3. categoryHint填分类，只能是：餐饮/交通/购物/生活缴费/娱乐/医疗/教育/转账/人情/退款/工资/奖金/理财/其他
+            4. note填商品名，如：咖啡、洗衣液、手机壳。禁止填购物、餐饮等分类名，无法确定时留空
+            5. 支付成功页面+有金额→confidence≥0.65。非消费页面→confidence<0.5
+            6. 退款相关→type=INCOME, categoryHint=退款
+            7. isSpam=true：非支付页面、还款页面、账单提醒、广告页面
+            页面文本：${rawText.take(3000)}
         """".trimIndent()
         return JSONObject()
             .put("model", model)
             .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", prompt)))
             .put("temperature", 0)
             .put("max_tokens", 480)
+            .put("thinking", JSONObject().put("type", "disabled"))
     }
 
     fun postJsonPublic(config: AiRecognitionConfig, body: JSONObject): String = postJson(config, body)
 
     private fun postJson(config: AiRecognitionConfig, body: JSONObject): String {
-        stats.record(true) // will be updated with tokens after response
-        val connection = (URL(normalizeChatCompletionsUrl(config.apiUrl)).openConnection() as HttpURLConnection).apply {
+        val url = normalizeChatCompletionsUrl(config.apiUrl)
+        android.util.Log.d("AiRecognizer", "POST ${url}, model=${body.optString("model")}, bodyLen=${body.toString().length}")
+        val connection = (URL(url).openConnection() as HttpURLConnection).apply {
             requestMethod = "POST"
             connectTimeout = config.timeoutSeconds * 1000
             readTimeout = config.timeoutSeconds * 1000
@@ -200,12 +224,21 @@ class AiScreenshotRecognizer {
             setRequestProperty("Content-Type", "application/json; charset=utf-8")
             setRequestProperty("Authorization", "Bearer ${config.apiKey}")
         }
-        connection.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
-        val code = connection.responseCode
-        val stream = if (code in 200..299) connection.inputStream else connection.errorStream
-        val text = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
-        if (code !in 200..299) error("AI 接口返回 $code：${text.take(180)}")
-        return text
+        return try {
+            connection.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+            val code = connection.responseCode
+            val stream = if (code in 200..299) connection.inputStream else connection.errorStream
+            val text = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
+            android.util.Log.d("AiRecognizer", "Response: code=${code}, bodyLen=${text.length}, preview=${text.take(120)}")
+            if (code !in 200..299) {
+                stats.record(false)
+                error("AI 接口返回 $code：${text.take(180)}")
+            }
+            trackUsage(text)
+            text
+        } finally {
+            connection.disconnect()
+        }
     }
 
     private fun normalizeChatCompletionsUrl(rawUrl: String): String {
@@ -280,6 +313,7 @@ class AiScreenshotRecognizer {
             .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", content)))
             .put("temperature", 0)
             .put("max_tokens", 8)
+            .put("thinking", JSONObject().put("type", "disabled"))
     }
 
     private fun validateChatResponse(response: String) {
@@ -303,6 +337,7 @@ class AiScreenshotRecognizer {
                 }
             }
             ?: response
+        require(content.isNotBlank()) { "AI 返回内容为空" }
         return parseAiJson(content.extractJsonObject()) ?: error("AI 未返回有效 JSON")
     }
 
@@ -409,16 +444,26 @@ $truncated"""
                 rawJson = json.toString(),
                 isSpam = isSpam
             )
+        }.map { p ->
+            // 如果 note 等于 categoryHint 或是常见分类名，用 merchantName 替代
+            val cats = setOf("购物","餐饮","交通","生活缴费","娱乐","医疗","教育","转账","人情","退款","工资","奖金","理财","其他","宠物")
+            val fixedNote = if (p.note == p.categoryHint || p.note in cats) {
+                p.merchantName.takeIf { it != "AI识别消费" && it.length <= 20 }.orEmpty()
+            } else p.note
+            p.copy(note = fixedNote)
         }.getOrNull()
 
         private fun parseAmount(value: Any?): Long? {
-            val number = when (value) {
-                is Number -> value.toDouble()
-                is String -> value.replace(",", "").replace("￥", "").replace("¥", "").replace("元", "").trim().toDoubleOrNull()
-                else -> null
-            } ?: return null
-            return number.takeIf { it > 0 }?.let { (it * 100).roundToLong() }
-        }
+                    val number = when (value) {
+                        is Number -> value.toDouble()
+                        is String -> value.replace(",", "").replace("￥", "").replace("¥", "").replace("元", "").trim().toDoubleOrNull()
+                        else -> null
+                    } ?: return null
+                    // 金额单位是元；超过 1 亿视为脏数据；AI 若已返回「分」会异常大
+                    if (number <= 0.0 || number > 100_000_000.0) return null
+                    val cents = (number * 100).roundToLong()
+                                        return cents.takeIf { it in 1L..10_000_000_000L }
+                }
 
         private fun parseConfidence(value: Any?): Float {
             val number = when (value) {
@@ -444,12 +489,18 @@ $truncated"""
         private fun parsePaidAt(text: String): Long? {
             val value = text.trim().replace('/', '-').replace('年', '-').replace('月', '-').replace("日", " ")
             if (value.isBlank()) return null
-            return runCatching {
+            val millis = runCatching {
                 val normalized = if (value.length <= 10) "$value 00:00" else value.take(16)
                 LocalDateTime.parse(normalized.replace(' ', 'T')).atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
             }.recoverCatching {
                 LocalDate.parse(value.take(10)).atTime(LocalTime.MIN).atZone(ZoneId.systemDefault()).toInstant().toEpochMilli()
-            }.getOrNull()
+            }.getOrNull() ?: return null
+            // 拒绝离谱时间：早于 2023 或晚于当前+1天，一律当无效
+            val now = System.currentTimeMillis()
+            val min = LocalDate.of(2023, 1, 1).atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli()
+            val max = now + 24 * 60 * 60 * 1000L
+            if (millis < min || millis > max) return null
+            return millis
         }
     }
 }

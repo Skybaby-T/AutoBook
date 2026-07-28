@@ -1,10 +1,13 @@
 ﻿package com.tao.autobook
 
 import android.Manifest
+import android.app.ActivityManager
 import android.content.Intent
 import android.os.Build
+import android.os.Environment
 import android.os.Bundle
 import android.net.Uri
+import android.provider.OpenableColumns
 import android.provider.Settings
 import android.text.TextUtils
 import androidx.activity.ComponentActivity
@@ -33,9 +36,19 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        if (Build.VERSION.SDK_INT >= 33) requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 20)
+        if (Build.VERSION.SDK_INT >= 33) {
+            requestPermissions(
+                arrayOf(
+                    Manifest.permission.POST_NOTIFICATIONS,
+                    Manifest.permission.READ_MEDIA_IMAGES
+                ),
+                20
+            )
+        } else {
+            requestPermissions(arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE), 20)
+        }
         requestPermissions(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION), 21)
-        startForegroundService(Intent(this, KeepAliveService::class.java))
+        try { startForegroundService(Intent(this, KeepAliveService::class.java)) } catch (_: Exception) {}
         pendingTransactionId.value = intent.getLongExtra(AutoBookNotifier.EXTRA_TRANSACTION_ID, -1L).takeIf { it > 0 }
         setContent { AutoBookRoot() }
     }
@@ -73,6 +86,11 @@ class MainActivity : ComponentActivity() {
             onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
         }
         val vm: AutoBookViewModel = viewModel(factory = AutoBookViewModelFactory(app.repository))
+        var notificationAutoBookEnabled by remember { mutableStateOf(vm.isNotificationAutoBookEnabled()) }
+        var hideFromRecents by remember { mutableStateOf(vm.isHideFromRecentsEnabled()) }
+        var autoDeleteScreenshot by remember { mutableStateOf(vm.isAutoDeleteScreenshotEnabled()) }
+        // 启动时按设置同步「最近任务隐藏」
+        LaunchedEffect(Unit) { setExcludeFromRecents(hideFromRecents) }
         val state by vm.state.collectAsState()
         val chatMessages by vm.chatMessages.collectAsState()
         val isChatSending by vm.isChatSending.collectAsState()
@@ -92,8 +110,34 @@ class MainActivity : ComponentActivity() {
         val pickManualVoucher = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia(6)) { uris ->
             manualVoucherUris = uris
         }
+        val exportBackupLauncher = rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("application/json")) { uri ->
+            if (uri != null) {
+                vm.exportBackup { json ->
+                    contentResolver.openOutputStream(uri)?.use { it.write(json.toByteArray()) }
+                }
+            }
+        }
+        val importBackupLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            if (uri != null) {
+                val jsonStr = contentResolver.openInputStream(uri)?.use { it.readBytes().toString(Charsets.UTF_8) }
+                if (jsonStr != null) vm.importBackup(jsonStr)
+            }
+        }
         val pickBillFiles = rememberLauncherForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
             vm.importBillFiles(uris)
+        }
+        // 聊天图片/文件选择器
+        var pendingChatImageUri by remember { mutableStateOf<String?>(null) }
+        var pendingChatFileName by remember { mutableStateOf<String?>(null) }
+        val pickChatImage = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+            if (uri != null) {
+                pendingChatImageUri = uri.toString()
+            }
+        }
+        val pickChatFile = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+            if (uri != null) {
+                pendingChatFileName = getDisplayName(uri) ?: "附件"
+            }
         }
 
         DisposableEffect(Unit) {
@@ -148,6 +192,23 @@ class MainActivity : ComponentActivity() {
             onClearUnconfirmedScreenshots = vm::clearUnconfirmedScreenshotCache,
             onMessageConsumed = vm::clearMessage,
             notificationEnabled = notificationEnabled,
+            notificationAutoBookEnabled = notificationAutoBookEnabled,
+            onToggleNotificationAutoBook = {
+                vm.setNotificationAutoBookEnabled(it)
+                notificationAutoBookEnabled = it
+            },
+            hideFromRecents = hideFromRecents,
+            onToggleHideFromRecents = {
+                vm.setHideFromRecentsEnabled(it)
+                hideFromRecents = it
+                setExcludeFromRecents(it)
+            },
+            autoDeleteScreenshot = autoDeleteScreenshot,
+            onToggleAutoDeleteScreenshot = {
+                vm.setAutoDeleteScreenshotEnabled(it)
+                autoDeleteScreenshot = it
+                if (it) requestAllFilesAccessIfNeeded()
+            },
             accessibilityEnabled = accessibilityEnabled,
             openTransactionId = openTransactionId,
             notice = notice,
@@ -159,12 +220,16 @@ class MainActivity : ComponentActivity() {
             onExitApp = { finish() },
             onLoadLogs = { vm.loadLogs() },
             onClearLogs = { vm.clearLogs() },
+            onClearAllPending = { vm.clearAllPending() },
             onSaveAiNotificationPrompt = { vm.saveCustomPrompt("notification", it) },
             onSaveAiAccessibilityPrompt = { vm.saveCustomPrompt("accessibility", it) },
+            onSaveAiScreenshotPrompt = { vm.saveCustomPrompt("screenshot", it) },
             aiNotificationPrompt = vm.getCustomPrompt("notification"),
             aiAccessibilityPrompt = vm.getCustomPrompt("accessibility"),
+            aiScreenshotPrompt = vm.getCustomPrompt("screenshot"),
             defaultNotificationPrompt = vm.getDefaultPrompt("notification"),
             defaultAccessibilityPrompt = vm.getDefaultPrompt("accessibility"),
+            defaultScreenshotPrompt = vm.getDefaultPrompt("screenshot"),
             onAddKeyword = { vm.addCustomKeyword(it) },
             onRemoveKeyword = { vm.removeCustomKeyword(it) },
             customKeywords = customKeywords,
@@ -172,9 +237,36 @@ class MainActivity : ComponentActivity() {
             onRefreshAiStats = { vm.refreshAiStats() },
             chatMessages = chatMessages,
             isChatSending = isChatSending,
-            onSendChat = { vm.sendChatMessage(it) },
+            onSendChat = { msg, imgUri, fName ->
+                vm.sendChatMessage(msg, imgUri, fName)
+                pendingChatImageUri = null
+                pendingChatFileName = null
+            },
             onExecuteChatOp = { vm.executeChatOperation(it) },
             onClearChatHistory = { vm.clearChatHistory() },
+            onPickChatImage = { pickChatImage.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) },
+            onPickChatFile = { pickChatFile.launch(arrayOf("*/*")) },
+            pendingChatImageUri = pendingChatImageUri,
+            pendingChatFileName = pendingChatFileName,
+            onClearPendingChatImage = { pendingChatImageUri = null },
+            onClearPendingChatFile = { pendingChatFileName = null },
+            onExportBackup = {
+                vm.exportBackup { json ->
+                    val exportDir = java.io.File(cacheDir, "exports").also { it.mkdirs() }
+                    val file = java.io.File(exportDir, "autobook-backup-${System.currentTimeMillis()}.json")
+                    file.writeText(json)
+                    val uri = FileProvider.getUriForFile(this@MainActivity, "$packageName.fileprovider", file)
+                    val intent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                        type = "application/json"
+                        putExtra(android.content.Intent.EXTRA_STREAM, uri)
+                        addFlags(android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+                    startActivity(android.content.Intent.createChooser(intent, "导出数据"))
+                }
+            },
+            onImportBackupClick = {
+                importBackupLauncher.launch(arrayOf("application/json"))
+            },
             onAddNotificationRule = vm::addNotificationRule,
             onDeleteNotificationRule = vm::deleteNotificationRule,
         )
@@ -191,6 +283,36 @@ class MainActivity : ComponentActivity() {
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
         startActivity(Intent.createChooser(intent, "导出账本 CSV"))
+    }
+
+
+
+    /** Android 11+ 删除系统截图需要「所有文件访问」权限 */
+    private fun requestAllFilesAccessIfNeeded() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            if (!Environment.isExternalStorageManager()) {
+                try {
+                    val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION).apply {
+                        data = Uri.parse("package:$packageName")
+                    }
+                    startActivity(intent)
+                } catch (_: Exception) {
+                    try {
+                        startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+                    } catch (_: Exception) {}
+                }
+            }
+        }
+    }
+
+    private fun setExcludeFromRecents(hide: Boolean) {
+        try {
+            val am = getSystemService(ACTIVITY_SERVICE) as ActivityManager
+            am.appTasks.forEach { task ->
+                runCatching { task.setExcludeFromRecents(hide) }
+            }
+        } catch (_: Exception) {
+        }
     }
 
     private fun openAppNotificationSettings() {
@@ -222,5 +344,14 @@ class MainActivity : ComponentActivity() {
             if (service.contains(packageName) && service.contains("PaymentAccessibilityService")) return true
         }
         return false
+    }
+
+    private fun getDisplayName(uri: Uri): String? {
+        return try {
+            contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (nameIndex >= 0 && cursor.moveToFirst()) cursor.getString(nameIndex) else null
+            }
+        } catch (_: Exception) { null }
     }
 }

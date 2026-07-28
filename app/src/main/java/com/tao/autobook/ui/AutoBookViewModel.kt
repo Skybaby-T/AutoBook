@@ -17,6 +17,7 @@ import com.tao.autobook.data.PendingScreenshotReview
 import com.tao.autobook.data.TransactionEntity
 import com.tao.autobook.data.TransactionType
 import com.tao.autobook.notify.AutoBookNotice
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -82,49 +83,91 @@ class AutoBookViewModel(private val repository: AutoBookRepository) : ViewModel(
     val openTransactionEvents: SharedFlow<Long> = openTransactionRequest
     val noticeEvents: SharedFlow<AutoBookNotice> = autoBookNotices
 
-    private val baseState = combine(
-        repository.transactions,
-        repository.categories,
-        pendingReviews,
-        busy,
-        message
+    // 将 6 层 combine 嵌套拆分为 3 组并行 combine + 1 次合并，避免深嵌套
+    private data class BaseGroup(
+        val txs: List<TransactionEntity>,
+        val cats: List<CategoryEntity>,
+        val pending: List<PendingScreenshotReview>,
+        val isBusy: Boolean,
+        val msg: String?
+    )
+    private data class AiSyncGroup(
+        val rules: List<NotificationRuleEntity>,
+        val ai: AiRecognitionSettings,
+        val models: List<String>,
+        val preview: Pair<Long, List<Bitmap>>?,
+        val logList: List<AutoBookLogEntry>
+    )
+    private data class StatsGroup(
+        val aiStats: String,
+        val syncFb: String,
+        val about: com.tao.autobook.data.AutoBookRepository.AboutInfo,
+        val mExp: Long,
+        val mInc: Long,
+        val tExp: Long
+    )
+
+    private val baseGroup: Flow<BaseGroup> = combine(
+        repository.transactions, repository.categories, pendingReviews, busy, message
     ) { txs, cats, pending, isBusy, msg ->
-        AutoBookUiState(txs, cats.ifEmpty { BuiltInCategories.defaults }, pending, isBusy, msg, repository.screenshotStorageBytes())
+        BaseGroup(txs, cats, pending, isBusy, msg)
+    }
+    private val aiSyncGroup: Flow<AiSyncGroup> = combine(
+        notificationRules, repository.aiSettings, aiModels, voucherPreview, logs
+    ) { rules, ai, models, preview, logList ->
+        AiSyncGroup(rules, ai, models, preview, logList)
+    }
+    private val statsGroup: Flow<StatsGroup> = combine(
+        aiStatsFlow, syncFeedbackFlow, aboutInfoFlow, monthExpenseFlow, monthIncomeFlow
+    ) { statsStr, syncFb, about, mExp, mInc ->
+        StatsGroup(statsStr, syncFb, about, mExp, mInc, 0L)
     }
 
-    private val baseWithRules = combine(baseState, notificationRules) { base, rules ->
-        base.copy(notificationRules = rules)
-    }
-
-    private val stateWithAi = combine(baseWithRules, repository.aiSettings, aiModels, voucherPreview, logs) { base, ai, models, preview, logList ->
-        base.copy(aiSettings = ai, aiModels = models, voucherPreviewTransactionId = preview?.first, voucherPreviewBitmaps = preview?.second ?: emptyList(), logs = logList)
-    }
-    private val stateWithSync = combine(stateWithAi, aiStatsFlow, syncFeedbackFlow, aboutInfoFlow) { base, statsStr, syncFb, about ->
-        base.copy(aiStats = statsStr, syncFeedback = syncFb, aboutInfo = about)
-    }
-    private val stateWithStats = combine(stateWithSync, monthExpenseFlow, monthIncomeFlow, todayExpenseFlow) { base, mExp, mInc, tExp ->
-        base.copy(monthExpenseCents = mExp, monthIncomeCents = mInc, todayExpenseCents = tExp)
-    }
-    val state: StateFlow<AutoBookUiState> = combine(stateWithStats, todayIncomeFlow) { base, tInc ->
-        base.copy(todayIncomeCents = tInc)
+    val state: StateFlow<AutoBookUiState> = combine(
+        baseGroup, aiSyncGroup, statsGroup, todayExpenseFlow, todayIncomeFlow
+    ) { base, aiSync, stats, tExp, tInc ->
+        AutoBookUiState(
+            transactions = base.txs,
+            categories = base.cats.ifEmpty { BuiltInCategories.defaults },
+            pending = base.pending,
+            isBusy = base.isBusy,
+            message = base.msg,
+            screenshotBytes = repository.screenshotStorageBytes(),
+            notificationRules = aiSync.rules,
+            aiSettings = aiSync.ai,
+            aiModels = aiSync.models,
+            voucherPreviewTransactionId = aiSync.preview?.first,
+            voucherPreviewBitmaps = aiSync.preview?.second ?: emptyList(),
+            logs = aiSync.logList,
+            aiStats = stats.aiStats,
+            syncFeedback = stats.syncFb,
+            aboutInfo = stats.about,
+            monthExpenseCents = stats.mExp,
+            monthIncomeCents = stats.mInc,
+            todayExpenseCents = tExp,
+            todayIncomeCents = tInc
+        )
     }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), AutoBookUiState())
 
     init {
         viewModelScope.launch { repository.observeNotificationRules().collect { notificationRules.value = it } }
+        viewModelScope.launch { repository.observeLogs().collect { logs.value = it } }
         fetchAboutInfo()
         // 月度/日度统计：每30秒刷新一次（数据库聚合查询）
-        viewModelScope.launch {
-            while (true) {
-                val now = java.time.LocalDate.now()
-                val monthStart = now.withDayOfMonth(1).atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
-                val todayStart = now.atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
-                monthExpenseFlow.value = repository.getMonthExpense(monthStart)
-                monthIncomeFlow.value = repository.getMonthIncome(monthStart)
-                todayExpenseFlow.value = repository.getTodayExpense(todayStart)
-                todayIncomeFlow.value = repository.getTodayIncome(todayStart)
-                kotlinx.coroutines.delay(30_000L)
-            }
-        }
+                viewModelScope.launch {
+                    while (true) {
+                        runCatching {
+                            val now = java.time.LocalDate.now()
+                            val monthStart = now.withDayOfMonth(1).atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
+                            val todayStart = now.atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
+                            monthExpenseFlow.value = repository.getMonthExpense(monthStart)
+                            monthIncomeFlow.value = repository.getMonthIncome(monthStart)
+                            todayExpenseFlow.value = repository.getTodayExpense(todayStart)
+                            todayIncomeFlow.value = repository.getTodayIncome(todayStart)
+                        }
+                        kotlinx.coroutines.delay(30_000L)
+                    }
+                }
         viewModelScope.launch {
             repository.pendingScreenshots.collect { pendingReviews.value = repository.buildPendingReviews(it) }
         }
@@ -159,6 +202,7 @@ class AutoBookViewModel(private val repository: AutoBookRepository) : ViewModel(
     }
 
     fun clearVoucherPreview() {
+        voucherPreview.value?.second?.forEach { it.recycle() }
         voucherPreview.value = null
     }
 
@@ -234,6 +278,15 @@ class AutoBookViewModel(private val repository: AutoBookRepository) : ViewModel(
             }.onFailure {
                 message.value = it.message ?: "验证模型列表失败"
             }
+            busy.value = false
+        }
+    }
+
+    fun clearAllPending() {
+        viewModelScope.launch {
+            busy.value = true
+            val count = repository.clearAllPendingScreenshots()
+            message.value = "已清空 $count 条待确认记录"
             busy.value = false
         }
     }
@@ -320,12 +373,12 @@ class AutoBookViewModel(private val repository: AutoBookRepository) : ViewModel(
     fun deleteTransactions(ids: Set<Long>) {
         if (ids.isEmpty()) return
         viewModelScope.launch {
-            ids.forEach { repository.deleteTransactionWithImages(it) }
+            repository.deleteTransactionsWithImages(ids)
             message.value = "已删除 ${ids.size} 笔账单"
         }
     }
 
-    fun saveCategory(existing: CategoryEntity?, name: String, type: TransactionType, color: Long, icon: String) {
+    fun saveCategory(existing: CategoryEntity?, name: String, type: TransactionType, color: Long, icon: String, parentId: String? = null) {
         viewModelScope.launch {
             val id = existing?.id ?: "cat_${UUID.randomUUID().toString().replace("-", "").take(12)}"
             val sortOrder = existing?.sortOrder ?: ((state.value.categories.filter { it.type == type }.maxOfOrNull { it.sortOrder } ?: 0) + 10)
@@ -337,7 +390,8 @@ class AutoBookViewModel(private val repository: AutoBookRepository) : ViewModel(
                     color = color,
                     sortOrder = sortOrder,
                     type = type,
-                    isDefault = existing?.isDefault ?: false
+                    isDefault = existing?.isDefault ?: false,
+                    parentId = parentId ?: existing?.parentId
                 )
             )
             message.value = "分类已保存"
@@ -404,11 +458,11 @@ class AutoBookViewModel(private val repository: AutoBookRepository) : ViewModel(
         }
     }
 
-    fun sendChatMessage(message: String) {
-        if (message.isBlank()) return
+    fun sendChatMessage(message: String, imageUri: String? = null, fileName: String? = null) {
+        if (message.isBlank() && imageUri == null) return
         viewModelScope.launch {
             chatSending.value = true
-            val reply = repository.sendChatMessage(message)
+            val reply = repository.sendChatMessage(message, imageUri, fileName)
             chatSending.value = false
         }
     }
@@ -500,6 +554,27 @@ class AutoBookViewModel(private val repository: AutoBookRepository) : ViewModel(
     fun saveCustomPrompt(type: String, prompt: String) {
         repository.saveCustomPrompt(type, prompt)
         message.value = "AI提示词已保存"
+    }
+
+    fun isNotificationAutoBookEnabled(): Boolean = repository.isNotificationAutoBookEnabled()
+
+    fun setNotificationAutoBookEnabled(enabled: Boolean) {
+        repository.setNotificationAutoBookEnabled(enabled)
+        message.value = if (enabled) "已开启通知自动记账" else "已关闭通知自动记账（截图记账不受影响）"
+    }
+
+    fun isHideFromRecentsEnabled(): Boolean = repository.isHideFromRecentsEnabled()
+
+    fun setHideFromRecentsEnabled(enabled: Boolean) {
+        repository.setHideFromRecentsEnabled(enabled)
+        message.value = if (enabled) "已在最近任务中隐藏本应用" else "已在最近任务中显示本应用"
+    }
+
+    fun isAutoDeleteScreenshotEnabled(): Boolean = repository.isAutoDeleteScreenshotEnabled()
+
+    fun setAutoDeleteScreenshotEnabled(enabled: Boolean) {
+        repository.setAutoDeleteScreenshotEnabled(enabled)
+        message.value = if (enabled) "已开启记账后自动删除截图" else "已关闭自动删除截图"
     }
 
     fun fetchAboutInfo() {

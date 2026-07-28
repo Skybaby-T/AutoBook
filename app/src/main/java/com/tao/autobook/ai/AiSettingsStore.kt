@@ -26,14 +26,15 @@ class AiSettingsStore(
     }
 
     val settings: Flow<AiRecognitionSettings> = context.aiDataStore.data.map { prefs ->
-        AiRecognitionSettings(
-            enabled = prefs[Keys.enabled] ?: false,
-            apiUrl = prefs[Keys.apiUrl].orEmpty(),
-            model = prefs[Keys.model].orEmpty(),
-            apiKeySet = !prefs[Keys.encryptedApiKey].isNullOrBlank(),
-            timeoutSeconds = (prefs[Keys.timeoutSeconds] ?: 30).coerceIn(8, 90)
-        )
-    }
+            AiRecognitionSettings(
+                enabled = prefs[Keys.enabled] ?: false,
+                apiUrl = prefs[Keys.apiUrl].orEmpty(),
+                model = prefs[Keys.model].orEmpty(),
+                apiKeySet = !prefs[Keys.encryptedApiKey].isNullOrBlank(),
+                // 截图识别默认 60s，避免传图经常 timeout 掉到本地 OCR 乱金额
+                timeoutSeconds = (prefs[Keys.timeoutSeconds] ?: 60).coerceIn(8, 90)
+            )
+        }
 
     suspend fun save(settings: AiRecognitionSettings, plainApiKey: String?) {
         context.aiDataStore.edit { prefs ->
@@ -52,13 +53,14 @@ class AiSettingsStore(
         val prefs = context.aiDataStore.data.first()
         val encryptedKey = prefs[Keys.encryptedApiKey].orEmpty()
         val key = if (encryptedKey.isBlank()) "" else runCatching { cryptoStore.decryptFromString(encryptedKey) }.getOrDefault("")
+        android.util.Log.d("AiSettings", "loadConfig: enabled=${prefs[Keys.enabled]}, url=${prefs[Keys.apiUrl]?.take(30)}, model=${prefs[Keys.model]}, keyLen=${key.length}")
         return AiRecognitionConfig(
-            enabled = prefs[Keys.enabled] ?: false,
-            apiUrl = prefs[Keys.apiUrl].orEmpty(),
-            model = prefs[Keys.model].orEmpty(),
-            apiKey = key,
-            timeoutSeconds = (prefs[Keys.timeoutSeconds] ?: 30).coerceIn(8, 90)
-        )
+                    enabled = prefs[Keys.enabled] ?: false,
+                    apiUrl = prefs[Keys.apiUrl].orEmpty(),
+                    model = prefs[Keys.model].orEmpty(),
+                    apiKey = key,
+                    timeoutSeconds = (prefs[Keys.timeoutSeconds] ?: 60).coerceIn(8, 90)
+                )
     }
 }
 

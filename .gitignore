@@ -11,3 +11,10 @@
 *.jks
 *.keystore
 release-keystore.jks
+
+# local logs / build
+app/build/
+CHAT-LOG.md
+CHAT-LOG-FULL.md
+DEV-LOG.md
+*.log

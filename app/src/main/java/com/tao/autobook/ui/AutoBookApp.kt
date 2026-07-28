@@ -6,9 +6,11 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
@@ -19,10 +21,12 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.activity.compose.BackHandler
@@ -56,6 +60,7 @@ import androidx.compose.material.icons.filled.ReceiptLong
 import androidx.compose.material.icons.filled.Restaurant
 import androidx.compose.material.icons.filled.Savings
 import androidx.compose.material.icons.filled.School
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.ShoppingBag
 import androidx.compose.material.icons.filled.SwapHoriz
@@ -75,6 +80,7 @@ import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.SwipeToDismissBox
@@ -106,8 +112,11 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.unit.dp
 import com.tao.autobook.ai.AiRecognitionSettings
 import com.tao.autobook.data.BuiltInCategories
@@ -120,6 +129,8 @@ import com.tao.autobook.data.PaymentApp
 import com.tao.autobook.data.TransactionEntity
 import com.tao.autobook.data.TransactionType
 import com.tao.autobook.notify.AutoBookNotice
+import java.math.BigDecimal
+import java.math.RoundingMode
 import java.time.Instant
 import java.time.LocalDate
 import java.time.LocalDateTime
@@ -180,7 +191,7 @@ fun AutoBookApp(
     onAddManual: (String, String, String, TransactionType, Long, String, PaymentApp) -> Unit,
     onUpdateTransaction: (Long, String, String, String, TransactionType, Long, String) -> Unit,
     onUpdateTransactionWithApp: (Long, String, String, String, TransactionType, Long, String, com.tao.autobook.data.PaymentApp) -> Unit = { _, _, _, _, _, _, _, _ -> },
-    onSaveCategory: (CategoryEntity?, String, TransactionType, Long, String) -> Unit,
+    onSaveCategory: (CategoryEntity?, String, TransactionType, Long, String, String?) -> Unit,
     onDeleteCategory: (CategoryEntity) -> Unit,
     onExportCsv: () -> Unit,
     onImportBills: () -> Unit,
@@ -190,6 +201,12 @@ fun AutoBookApp(
     onClearUnconfirmedScreenshots: () -> Unit,
     onMessageConsumed: () -> Unit,
     notificationEnabled: Boolean,
+    notificationAutoBookEnabled: Boolean = true,
+    onToggleNotificationAutoBook: (Boolean) -> Unit = {},
+    hideFromRecents: Boolean = true,
+    onToggleHideFromRecents: (Boolean) -> Unit = {},
+    autoDeleteScreenshot: Boolean = false,
+    onToggleAutoDeleteScreenshot: (Boolean) -> Unit = {},
     accessibilityEnabled: Boolean,
     openTransactionId: Long?,
     notice: AutoBookNotice?,
@@ -205,17 +222,28 @@ fun AutoBookApp(
     onRefreshAiStats: () -> Unit = {},
     chatMessages: List<com.tao.autobook.data.ChatMessage> = emptyList(),
     isChatSending: Boolean = false,
-    onSendChat: (String) -> Unit = {},
+    onSendChat: (String, String?, String?) -> Unit = { _, _, _ -> },
     onExecuteChatOp: (String) -> Unit = {},
     onClearChatHistory: () -> Unit = {},
+    onPickChatImage: () -> Unit = {},
+    onPickChatFile: () -> Unit = {},
+    pendingChatImageUri: String? = null,
+    pendingChatFileName: String? = null,
+    onClearPendingChatImage: () -> Unit = {},
+    onClearPendingChatFile: () -> Unit = {},
+    onClearAllPending: () -> Unit = {},
     onSaveAiNotificationPrompt: (String) -> Unit = {},
     onSaveAiAccessibilityPrompt: (String) -> Unit = {},
+    onSaveAiScreenshotPrompt: (String) -> Unit = {},
     aiNotificationPrompt: String = "",
     aiAccessibilityPrompt: String = "",
+    aiScreenshotPrompt: String = "",
     defaultNotificationPrompt: String = "",
     defaultAccessibilityPrompt: String = "",
+    defaultScreenshotPrompt: String = "",
     onExportBackup: () -> Unit = {},
     onImportBackup: (String) -> Unit = {},
+    onImportBackupClick: () -> Unit = {},
     onSyncPush: (String, String) -> Unit = { _, _ -> },
     onSyncPull: (String, String) -> Unit = { _, _ -> },
     onSyncConfig: (String, String) -> Unit = { _, _ -> },
@@ -346,16 +374,25 @@ fun AutoBookApp(
                         onSend = onSendChat,
                         onExecuteOp = onExecuteChatOp,
                         onClearHistory = onClearChatHistory,
-                        onBack = { showChat = false }
+                        onBack = { showChat = false },
+                        onPickImage = onPickChatImage,
+                        onPickFile = onPickChatFile,
+                        pendingImageUri = pendingChatImageUri,
+                        pendingFileName = pendingChatFileName,
+                        onClearPendingImage = onClearPendingChatImage,
+                        onClearPendingFile = onClearPendingChatFile
                     )
                 } else if (showAiPromptEditor) {
                     AiPromptEditorScreen(
                         notificationPrompt = aiNotificationPrompt,
                         accessibilityPrompt = aiAccessibilityPrompt,
+                        screenshotPrompt = aiScreenshotPrompt,
                         defaultNotificationPrompt = defaultNotificationPrompt,
                         defaultAccessibilityPrompt = defaultAccessibilityPrompt,
+                        defaultScreenshotPrompt = defaultScreenshotPrompt,
                         onSaveNotification = onSaveAiNotificationPrompt,
-                        onSaveAccessibility = onSaveAiAccessibilityPrompt
+                        onSaveAccessibility = onSaveAiAccessibilityPrompt,
+                        onSaveScreenshot = onSaveAiScreenshotPrompt
                     )
                 } else if (showWhitelistManager) {
                     WhitelistManagerScreen(customKeywords, onAddKeyword, onRemoveKeyword)
@@ -381,7 +418,7 @@ fun AutoBookApp(
                 } else if (showCategoryManager) {
                     CategoryManagerScreen(state, onSaveCategory, onDeleteCategory)
                 } else if (showPendingReview) {
-                    PendingReviewScreen(state, onConfirmPending, onIgnorePending)
+                    PendingReviewScreen(state, onConfirmPending, onIgnorePending, onClearAllPending = { onClearAllPending() })
                 } else {
                     when (tab) {
                         Tab.Ledger -> LedgerScreen(state, onImportScreenshot, onPendingReview = { showPendingReview = true }, onEdit = { editingTransaction = it }, onDelete = onDeleteTransaction, onDeleteBatch = onDeleteTransactions)
@@ -389,6 +426,12 @@ fun AutoBookApp(
                         Tab.Report -> ReportScreen(state)
                         Tab.Settings -> SettingsScreen(
                             state = state,
+                            notificationAutoBookEnabled = notificationAutoBookEnabled,
+                            onToggleNotificationAutoBook = onToggleNotificationAutoBook,
+                            hideFromRecents = hideFromRecents,
+                            onToggleHideFromRecents = onToggleHideFromRecents,
+                            autoDeleteScreenshot = autoDeleteScreenshot,
+                            onToggleAutoDeleteScreenshot = onToggleAutoDeleteScreenshot,
                             onNotification = onOpenNotificationSettings,
                             onAppNotification = onOpenAppNotificationSettings,
                             onAccessibility = onOpenAccessibilitySettings,
@@ -402,7 +445,7 @@ fun AutoBookApp(
                             onShowWhitelistManager = { showWhitelistManager = true },
                             onShowAiPromptEditor = { showAiPromptEditor = true },
                             onExportBackup = onExportBackup,
-                            onImportBackupClick = {},
+                            onImportBackupClick = onImportBackupClick,
                             onShowLogs = { showLogs = true; loadLogs() },
                             onSyncPush = onSyncPush,
                             onSyncPull = onSyncPull,
@@ -529,6 +572,7 @@ private fun LedgerScreen(state: AutoBookUiState, onImportScreenshot: () -> Unit,
     var selectedIds by remember { mutableStateOf(setOf<Long>()) }
     var selectionMode by remember { mutableStateOf(false) }
     var typeFilter by remember { mutableStateOf<TransactionType?>(null) } // null=全部, EXPENSE=支出, INCOME=收入
+    var searchQuery by remember { mutableStateOf("") }
 
     fun enterSelection(id: Long) { selectionMode = true; selectedIds = setOf(id) }
     fun toggleSelect(id: Long) { selectedIds = if (id in selectedIds) selectedIds - id else selectedIds + id }
@@ -545,15 +589,68 @@ private fun LedgerScreen(state: AutoBookUiState, onImportScreenshot: () -> Unit,
     }
     fun exitSelection() { selectionMode = false; selectedIds = emptySet() }
 
+    fun matchesSearch(tx: TransactionEntity, query: String): Boolean {
+        if (query.isBlank()) return true
+        val q = query.trim()
+        val categoryName = state.categories.firstOrNull { it.id == tx.categoryId }?.name.orEmpty()
+        val haystack = listOf(
+            tx.merchantName,
+            tx.note,
+            categoryName,
+            tx.paymentApp.label,
+            tx.type.label,
+            tx.sourceType.name,
+            "%.2f".format(tx.amount),
+            formatDate(tx.paidAt),
+            formatTime(tx.paidAt)
+        ).joinToString(" ").lowercase()
+        // 支持空格分词：全部词都命中才算匹配
+        return q.lowercase().split(Regex("\\s+")).filter { it.isNotBlank() }.all { token ->
+            haystack.contains(token)
+        }
+    }
+
     BackHandler(enabled = selectionMode) { exitSelection() }
 
     Box(Modifier.fillMaxSize()) {
-    val filteredTxs = if (typeFilter != null) state.transactions.filter { it.type == typeFilter } else state.transactions
+    val filteredTxs = state.transactions
+        .asSequence()
+        .filter { typeFilter == null || it.type == typeFilter }
+        .filter { matchesSearch(it, searchQuery) }
+        .toList()
     val grouped = filteredTxs.groupBy { formatDate(it.paidAt) }
     LazyColumn(Modifier.fillMaxSize().padding(
         start = 16.dp, end = 16.dp, top = 16.dp,
         bottom = if (selectionMode) 72.dp else 16.dp
     ), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        item {
+            OutlinedTextField(
+                value = searchQuery,
+                onValueChange = { searchQuery = it },
+                modifier = Modifier.fillMaxWidth(),
+                singleLine = true,
+                placeholder = { Text("搜索商户、备注、分类、金额…", color = Muted) },
+                leadingIcon = {
+                    Icon(Icons.Default.Search, contentDescription = null, tint = Muted)
+                },
+                trailingIcon = {
+                    if (searchQuery.isNotBlank()) {
+                        IconButton(onClick = { searchQuery = "" }) {
+                            Icon(Icons.Default.Close, contentDescription = "清空", tint = Muted)
+                        }
+                    }
+                },
+                shape = RoundedCornerShape(14.dp),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedBorderColor = Blue,
+                    unfocusedBorderColor = Line,
+                    focusedContainerColor = CardWhite,
+                    unfocusedContainerColor = CardWhite
+                ),
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
+                keyboardActions = KeyboardActions(onSearch = { /* 本地即时过滤，无需额外动作 */ })
+            )
+        }
         item { LedgerSummaryCard(state, typeFilter) { typeFilter = it } }
         if (!selectionMode) {
             item {
@@ -561,6 +658,15 @@ private fun LedgerScreen(state: AutoBookUiState, onImportScreenshot: () -> Unit,
                     ActionButton("上传截图补记", Icons.Default.PhotoLibrary, onImportScreenshot, Modifier.weight(1f))
                     ActionButton("待确认 ${state.pending.size}", Icons.Default.TaskAlt, onPendingReview, Modifier.weight(1f), secondary = true)
                 }
+            }
+        }
+        if (searchQuery.isNotBlank()) {
+            item {
+                Text(
+                    "找到 ${filteredTxs.size} 条结果",
+                    color = Muted,
+                    style = MaterialTheme.typography.bodySmall
+                )
             }
         }
         grouped.forEach { (date, txs) ->
@@ -577,7 +683,11 @@ private fun LedgerScreen(state: AutoBookUiState, onImportScreenshot: () -> Unit,
                 )
             }
         }
-        if (state.transactions.isEmpty()) item { EmptyHint("开启通知监听或导入支付截图后，账单会自动出现在这里。") }
+        if (state.transactions.isEmpty()) {
+            item { EmptyHint("截图后会自动记账；也可开启通知自动记账或导入账单。") }
+        } else if (filteredTxs.isEmpty()) {
+            item { EmptyHint(if (searchQuery.isNotBlank()) "没有匹配「$searchQuery」的账单" else "当前筛选下没有账单") }
+        }
     }
 
     // 底部批量操作栏
@@ -921,7 +1031,7 @@ private fun EntryScreen(
         NumberPad(
             onKey = { key -> amount = applyAmountKey(amount, key) },
             onDone = {
-                onAddManual(merchantInput, amount, categoryId, type, paidAt, note, paymentApp)
+                onAddManual(merchantInput, evaluateAmountExpression(amount), categoryId, type, paidAt, note, paymentApp)
                 amount = "0"
                 note = ""
                 merchantInput = ""
@@ -948,23 +1058,24 @@ private fun PaymentAppSelector(selected: PaymentApp, onSelect: (PaymentApp) -> U
     val apps = listOf(
         PaymentApp.WECHAT to "微信",
         PaymentApp.ALIPAY to "支付宝",
+        PaymentApp.PINDUODUO to "拼多多",
         PaymentApp.DOUYIN to "抖音",
         PaymentApp.JD to "京东",
         PaymentApp.UNION_PAY to "云闪付",
         PaymentApp.UNKNOWN to "其他"
     )
-    Row(
-        modifier.background(CardWhite, RoundedCornerShape(12.dp)).padding(horizontal = 8.dp, vertical = 6.dp),
-        horizontalArrangement = Arrangement.spacedBy(6.dp)
+    LazyRow(
+        modifier.background(CardWhite, RoundedCornerShape(12.dp)).padding(vertical = 6.dp),
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        contentPadding = PaddingValues(horizontal = 8.dp)
     ) {
-        apps.forEach { (app, label) ->
+        items(apps) { (app, label) ->
             val isSelected = selected == app
             Box(
                 Modifier
-                    .weight(1f)
                     .background(if (isSelected) BlueSoft else Color.Transparent, RoundedCornerShape(8.dp))
                     .clickable { onSelect(app) }
-                    .padding(vertical = 6.dp),
+                    .padding(horizontal = 12.dp, vertical = 6.dp),
                 contentAlignment = Alignment.Center
             ) {
                 Text(
@@ -996,19 +1107,73 @@ private fun TypeTabs(type: TransactionType, onChange: (TransactionType) -> Unit)
 
 @Composable
 private fun CategoryGrid(categories: List<CategoryEntity>, selected: String, onSelect: (String) -> Unit, modifier: Modifier = Modifier.height(246.dp)) {
-    LazyVerticalGrid(columns = GridCells.Fixed(5), modifier = modifier, verticalArrangement = Arrangement.spacedBy(10.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-        items(categories, key = { it.id }) { category ->
-            Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.clickable { onSelect(category.id) }) {
-                val tint = Color(category.color.toInt())
-                Box(
-                    Modifier.size(48.dp).background(if (selected == category.id) tint.copy(alpha = 0.24f) else Color.Transparent, RoundedCornerShape(12.dp)),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Box(Modifier.size(38.dp).background(tint.copy(alpha = 0.16f), RoundedCornerShape(10.dp)), contentAlignment = Alignment.Center) {
-                        Icon(iconFor(category.icon), contentDescription = category.name, tint = tint, modifier = Modifier.size(22.dp))
+    // Only show top-level categories in the grid
+    val topCategories = categories.filter { it.parentId == null }
+    // Find which top-level category is the parent of the selected subcategory
+    val selectedSub = categories.firstOrNull { it.id == selected && it.parentId != null }
+    val expandedTopId = remember { mutableStateOf<String?>(selectedSub?.parentId) }
+    // When selected changes, update expandedTopId
+    LaunchedEffect(selected) {
+        val sub = categories.firstOrNull { it.id == selected && it.parentId != null }
+        if (sub != null) expandedTopId.value = sub.parentId
+    }
+    val expandedCat = expandedTopId.value
+    val subcategories = if (expandedCat != null) categories.filter { it.parentId == expandedCat } else emptyList()
+
+    Column(modifier) {
+        LazyVerticalGrid(columns = GridCells.Fixed(5), modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(10.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            items(topCategories, key = { it.id }) { category ->
+                Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.clickable {
+                    val subs = categories.filter { it.parentId == category.id }
+                    if (subs.isNotEmpty()) {
+                        expandedTopId.value = if (expandedTopId.value == category.id) null else category.id
+                        // Auto-select first subcategory when expanding
+                        if (expandedTopId.value == category.id) {
+                            onSelect(subs.first().id)
+                        }
+                    } else {
+                        expandedTopId.value = null
+                        onSelect(category.id)
+                    }
+                }) {
+                    val tint = Color(category.color.toInt())
+                    val isExpanded = expandedTopId.value == category.id
+                    val isSelected = selected == category.id || isExpanded
+                    Box(
+                        Modifier.size(48.dp).background(if (isSelected) tint.copy(alpha = 0.24f) else Color.Transparent, RoundedCornerShape(12.dp)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Box(Modifier.size(38.dp).background(tint.copy(alpha = 0.16f), RoundedCornerShape(10.dp)), contentAlignment = Alignment.Center) {
+                            Icon(iconFor(category.icon), contentDescription = category.name, tint = tint, modifier = Modifier.size(22.dp))
+                        }
+                    }
+                    Text(category.name, color = Ink, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                }
+            }
+        }
+        // Subcategory row
+        if (subcategories.isNotEmpty()) {
+            Spacer(Modifier.height(8.dp))
+            Row(
+                Modifier.fillMaxWidth().background(CardWhite, RoundedCornerShape(12.dp)).padding(horizontal = 8.dp, vertical = 6.dp).horizontalScroll(rememberScrollState()),
+                horizontalArrangement = Arrangement.spacedBy(6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                subcategories.forEach { sub ->
+                    val subTint = Color(sub.color.toInt())
+                    val isSubSelected = selected == sub.id
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier
+                            .background(if (isSubSelected) subTint.copy(alpha = 0.18f) else Color.Transparent, RoundedCornerShape(8.dp))
+                            .clickable { onSelect(sub.id) }
+                            .padding(horizontal = 10.dp, vertical = 6.dp)
+                    ) {
+                        Box(Modifier.size(8.dp).background(subTint, CircleShape))
+                        Spacer(Modifier.width(4.dp))
+                        Text(sub.name, color = if (isSubSelected) subTint else Ink, style = MaterialTheme.typography.bodySmall, fontWeight = if (isSubSelected) FontWeight.Bold else FontWeight.Normal)
                     }
                 }
-                Text(category.name, color = Ink, style = MaterialTheme.typography.bodySmall, maxLines = 1, overflow = TextOverflow.Ellipsis)
             }
         }
     }
@@ -1016,7 +1181,7 @@ private fun CategoryGrid(categories: List<CategoryEntity>, selected: String, onS
 
 @Composable
 private fun NumberPad(onKey: (String) -> Unit, onDone: () -> Unit) {
-    val rows = listOf(listOf("1", "2", "3", "⌫"), listOf("4", "5", "6", "+"), listOf("7", "8", "9", "-"), listOf(".", "0", "再记一笔", "完成"))
+    val rows = listOf(listOf("1", "2", "3", "⌫"), listOf("4", "5", "6", "+"), listOf("7", "8", "9", "-"), listOf(".", "0", "=", "完成"))
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         rows.forEach { row ->
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
@@ -1025,7 +1190,7 @@ private fun NumberPad(onKey: (String) -> Unit, onDone: () -> Unit) {
                     Button(
                         onClick = { if (isDone) onDone() else onKey(key) },
                         modifier = Modifier.weight(1f).height(54.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = if (isDone) Blue else if (key == "再记一笔") Color(0xFFE0E6EF) else CardWhite, contentColor = if (isDone) Color.White else Ink),
+                        colors = ButtonDefaults.buttonColors(containerColor = if (isDone) Blue else if (key == "=") Color(0xFFE0E6EF) else CardWhite, contentColor = if (isDone) Color.White else Ink),
                         shape = RoundedCornerShape(12.dp)
                     ) { Text(key, fontWeight = FontWeight.SemiBold, maxLines = 1) }
                 }
@@ -1036,13 +1201,90 @@ private fun NumberPad(onKey: (String) -> Unit, onDone: () -> Unit) {
 
 private fun applyAmountKey(current: String, key: String): String = when (key) {
     "⌫" -> current.dropLast(1).ifBlank { "0" }
-    "+", "-", "再记一笔" -> current
-    "." -> if (current.contains('.')) current else "$current."
-    else -> {
-        val next = if (current == "0") key else current + key
-        val dot = next.indexOf('.')
-        if (dot >= 0 && next.length - dot > 3) current else next.take(10)
+    "+", "-" -> appendAmountOperator(current, key)
+    "=" -> evaluateAmountExpression(current)
+    "." -> appendAmountDecimal(current)
+    else -> appendAmountDigit(current, key)
+}
+
+private fun appendAmountOperator(current: String, operator: String): String {
+    val trimmed = current.ifBlank { "0" }.trimTrailingDecimal()
+    if (trimmed.lastOrNull()?.isAmountOperator() == true) {
+        return trimmed.dropLast(1) + operator
     }
+    val evaluated = evaluateAmountExpression(trimmed)
+    if (evaluated == "0" && operator == "-") return evaluated
+    return "$evaluated$operator"
+}
+
+private fun appendAmountDecimal(current: String): String {
+    val normalized = current.ifBlank { "0" }
+    if (normalized.lastOrNull()?.isAmountOperator() == true) return "${normalized}0."
+    val token = currentAmountToken(normalized)
+    if (token.contains('.')) return normalized
+    return "$normalized."
+}
+
+private fun appendAmountDigit(current: String, digit: String): String {
+    val normalized = current.ifBlank { "0" }
+    val token = currentAmountToken(normalized)
+    val prefix = normalized.dropLast(token.length)
+    val next = when {
+        normalized == "0" && digit == "0" -> "0"
+        token == "0" && !token.contains('.') -> prefix + digit
+        else -> normalized + digit
+    }
+    val nextToken = currentAmountToken(next)
+    val dot = nextToken.indexOf('.')
+    if (dot >= 0 && nextToken.length - dot > 3) return current
+    val integerDigits = nextToken.substringBefore('.').trimStart('0').length
+    if (integerDigits > 7) return current
+    return next.take(18)
+}
+
+private fun evaluateAmountExpression(expression: String): String {
+    var text = expression.ifBlank { "0" }
+        .trimTrailingOperator()
+        .trimTrailingDecimal()
+    if (text.isBlank()) return "0"
+
+    var total = BigDecimal.ZERO
+    var operator = '+'
+    var start = 0
+    for (i in 0..text.length) {
+        val atEnd = i == text.length
+        val ch = if (atEnd) null else text[i]
+        if (atEnd || ch == '+' || ch == '-') {
+            val numberText = text.substring(start, i).trimTrailingDecimal()
+            val value = numberText.toBigDecimalOrNull() ?: return "0"
+            total = if (operator == '-') total.subtract(value) else total.add(value)
+            if (!atEnd && ch != null) operator = ch
+            start = i + 1
+        }
+    }
+
+    if (total <= BigDecimal.ZERO) return "0"
+    if (total > BigDecimal("9999999.99")) total = BigDecimal("9999999.99")
+    return total.setScale(2, RoundingMode.HALF_UP)
+        .stripTrailingZeros()
+        .toPlainString()
+}
+
+private fun currentAmountToken(text: String): String {
+    val lastOperator = maxOf(text.lastIndexOf('+'), text.lastIndexOf('-'))
+    return if (lastOperator >= 0) text.substring(lastOperator + 1) else text
+}
+
+private fun String.trimTrailingOperator(): String = dropLastWhile { it.isAmountOperator() }
+
+private fun String.trimTrailingDecimal(): String = if (endsWith('.')) dropLast(1) else this
+
+private fun Char.isAmountOperator(): Boolean = this == '+' || this == '-'
+
+private fun String.toBigDecimalOrNull(): BigDecimal? = try {
+    BigDecimal(this)
+} catch (_: NumberFormatException) {
+    null
 }
 
 @Composable
@@ -1216,6 +1458,12 @@ private fun DonutChart(values: List<Long>, colors: List<Color>, modifier: Modifi
 @Composable
 private fun SettingsScreen(
     state: AutoBookUiState,
+    notificationAutoBookEnabled: Boolean = true,
+    onToggleNotificationAutoBook: (Boolean) -> Unit = {},
+    hideFromRecents: Boolean = true,
+    onToggleHideFromRecents: (Boolean) -> Unit = {},
+    autoDeleteScreenshot: Boolean = false,
+    onToggleAutoDeleteScreenshot: (Boolean) -> Unit = {},
     onNotification: () -> Unit,
     onAppNotification: () -> Unit,
     onAccessibility: () -> Unit,
@@ -1244,9 +1492,84 @@ private fun SettingsScreen(
 ) {
     LazyColumn(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item { SectionTitle("权限") }
-        item { SettingCard("通知监听", "${if (notificationEnabled) "已开启" else "未开启"} · 用于读取支付成功通知并自动记账", Icons.Default.Notifications, onNotification) }
+        item { SettingCard("通知监听权限", "${if (notificationEnabled) "系统已授权" else "系统未授权"} · 点此去系统设置开关通知使用权", Icons.Default.Notifications, onNotification) }
+        item {
+            Card(colors = CardDefaults.cardColors(containerColor = CardWhite), shape = RoundedCornerShape(14.dp), modifier = Modifier.fillMaxWidth()) {
+                Row(
+                    Modifier.fillMaxWidth().padding(14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Icon(Icons.Default.Notifications, contentDescription = null, tint = Blue)
+                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text("通知自动记账", color = Ink, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            if (notificationAutoBookEnabled) "开启：支付通知会自动记账"
+                            else "关闭：只靠截图记账，通知不入账",
+                            color = Muted,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                        if (notificationAutoBookEnabled && !notificationEnabled) {
+                            Text("系统通知使用权未开，开关开了也不会生效", color = Red, style = MaterialTheme.typography.labelSmall)
+                        }
+                    }
+                    Switch(
+                        checked = notificationAutoBookEnabled,
+                        onCheckedChange = onToggleNotificationAutoBook
+                    )
+                }
+            }
+        }
+        item {
+            Card(colors = CardDefaults.cardColors(containerColor = CardWhite), shape = RoundedCornerShape(14.dp), modifier = Modifier.fillMaxWidth()) {
+                Row(
+                    Modifier.fillMaxWidth().padding(14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Icon(Icons.Default.MoreHoriz, contentDescription = null, tint = Blue)
+                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text("最近任务中隐藏", color = Ink, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            if (hideFromRecents) "开启：从多任务/最近任务列表隐藏本应用"
+                            else "关闭：在最近任务列表中显示本应用",
+                            color = Muted,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                    Switch(
+                        checked = hideFromRecents,
+                        onCheckedChange = onToggleHideFromRecents
+                    )
+                }
+            }
+        }
+        item {
+            Card(colors = CardDefaults.cardColors(containerColor = CardWhite), shape = RoundedCornerShape(14.dp), modifier = Modifier.fillMaxWidth()) {
+                Row(
+                    Modifier.fillMaxWidth().padding(14.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Icon(Icons.Default.Delete, contentDescription = null, tint = Blue)
+                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text("记账成功自动删除截图", color = Ink, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            if (autoDeleteScreenshot) "开启：自动记账成功后自动删除相册原截图"
+                            else "关闭：保留相册截图",
+                            color = Muted,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                    Switch(
+                        checked = autoDeleteScreenshot,
+                        onCheckedChange = onToggleAutoDeleteScreenshot
+                    )
+                }
+            }
+        }
         item { SettingCard("系统横幅通知", "用于显示自动记账成功后的顶部弹窗；HyperOS 中请允许悬浮/横幅通知", Icons.Default.Notifications, onAppNotification) }
-        item { SettingCard("无障碍辅助", "${if (accessibilityEnabled) "已开启" else "未开启"} · ${if (state.aiSettings.configured) "用于识别支付成功页并尝试自动截图" else "需要先开启 AI 记账才能使用"}", Icons.Default.Accessibility, if (state.aiSettings.configured) onAccessibility else onShowAiRequiredDialog) }
+        item { SettingCard("无障碍辅助", "${if (accessibilityEnabled) "已开启" else "未开启"} · 当前版本不主动自动记账（仅保留服务）", Icons.Default.Accessibility, if (state.aiSettings.configured) onAccessibility else onShowAiRequiredDialog) }
         item { SectionTitle("账本") }
         item { SettingCard("分类管理", "新增、重命名、换色或删除消费分类", Icons.Default.Category, onOpenCategoryManager) }
         item { SettingCard("导入账单", "选择微信、支付宝、京东、淘宝、抖音等 CSV/TXT/XLSX 账单", Icons.Default.FileUpload, onImportBills) }
@@ -1267,43 +1590,58 @@ private fun SettingsScreen(
         item { SectionTitle("关于") }
         item {
             val about = state.aboutInfo
+            val ctx = LocalContext.current
+            fun openUrl(url: String) { ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
+            fun copyUrl(url: String) {
+                val cm = ctx.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                cm.setPrimaryClip(android.content.ClipData.newPlainText("url", url))
+                android.widget.Toast.makeText(ctx, "链接已复制", android.widget.Toast.LENGTH_SHORT).show()
+            }
+
             Card(colors = CardDefaults.cardColors(containerColor = CardWhite), shape = RoundedCornerShape(14.dp), modifier = Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("${about.title} v1.0.4", color = Ink, fontWeight = FontWeight.Bold)
+                    val appVer = try { ctx.packageManager.getPackageInfo(ctx.packageName, 0).versionName ?: "" } catch (_: Exception) { "" }
+                    Text("${about.title} v$appVer", color = Ink, fontWeight = FontWeight.Bold)
                     if (about.description.isNotBlank()) {
                         Text(about.description, color = Muted, style = MaterialTheme.typography.bodySmall)
                     }
+                    Spacer(Modifier.height(4.dp))
+                    // 官网
                     if (about.website.isNotBlank()) {
-                        val ctx = LocalContext.current
-                        Text(
-                            "官网：${about.website}",
-                            color = Blue,
-                            style = MaterialTheme.typography.bodySmall,
-                            modifier = Modifier.combinedClickable(
-                                onClick = { ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(about.website))) },
-                                onLongClick = {
-                                    val cm = ctx.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-                                    cm.setPrimaryClip(android.content.ClipData.newPlainText("url", about.website))
-                                    android.widget.Toast.makeText(ctx, "链接已复制", android.widget.Toast.LENGTH_SHORT).show()
-                                }
-                            )
-                        )
+                        Row(Modifier.fillMaxWidth().clickable { openUrl(about.website) }.padding(vertical = 2.dp)) {
+                            Text("官网  ", color = Ink, style = MaterialTheme.typography.bodySmall)
+                            Text(about.website, color = Blue, style = MaterialTheme.typography.bodySmall,
+                                modifier = Modifier.combinedClickable(
+                                    onClick = { openUrl(about.website) },
+                                    onLongClick = { copyUrl(about.website) }
+                                ))
+                        }
                     }
+                    // GitHub
+                    val github = about.github
+                    if (github.isNotBlank()) {
+                        Row(Modifier.fillMaxWidth().clickable { openUrl(github) }.padding(vertical = 2.dp)) {
+                            Text("GitHub ", color = Ink, style = MaterialTheme.typography.bodySmall)
+                            Text(github, color = Blue, style = MaterialTheme.typography.bodySmall,
+                                modifier = Modifier.combinedClickable(
+                                    onClick = { openUrl(github) },
+                                    onLongClick = { copyUrl(github) }
+                                ))
+                        }
+                    }
+                    // AI推荐
                     if (about.recommendations.isNotEmpty()) {
                         Spacer(Modifier.height(4.dp))
-                        Text("AI记账助手推荐", color = Ink, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodySmall)
+                        Text(about.sectionTitle, color = Ink, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodySmall)
                         about.recommendations.forEach { rec ->
-                            val ctx = LocalContext.current
-                            Row(
-                                Modifier.fillMaxWidth().clickable {
-                                    ctx.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(rec.url)))
-                                }.padding(vertical = 2.dp),
-                                horizontalArrangement = Arrangement.spacedBy(8.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text("•", color = Blue, fontWeight = FontWeight.Bold)
-                                Column {
-                                    Text(rec.name, color = Blue, fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.bodySmall)
+                            Column(Modifier.fillMaxWidth().clickable { openUrl(rec.url) }.padding(vertical = 3.dp)) {
+                                Text(rec.name, color = Ink, fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.bodySmall)
+                                Text(rec.url, color = Blue, style = MaterialTheme.typography.bodySmall,
+                                    modifier = Modifier.combinedClickable(
+                                        onClick = { openUrl(rec.url) },
+                                        onLongClick = { copyUrl(rec.url) }
+                                    ))
+                                if (rec.desc.isNotBlank()) {
                                     Text(rec.desc, color = Muted, style = MaterialTheme.typography.labelSmall)
                                 }
                             }
@@ -1419,9 +1757,11 @@ private fun AiSettingsDialog(
 }
 
 @Composable
-private fun CategoryManagerScreen(state: AutoBookUiState, onSave: (CategoryEntity?, String, TransactionType, Long, String) -> Unit, onDelete: (CategoryEntity) -> Unit) {
+private fun CategoryManagerScreen(state: AutoBookUiState, onSave: (CategoryEntity?, String, TransactionType, Long, String, String?) -> Unit, onDelete: (CategoryEntity) -> Unit) {
     var editing by remember { mutableStateOf<CategoryEntity?>(null) }
     var addingType by remember { mutableStateOf<TransactionType?>(null) }
+    var addingSubTo by remember { mutableStateOf<CategoryEntity?>(null) }
+    var expandedTopId by remember { mutableStateOf<String?>(null) }
     LazyColumn(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         TransactionType.entries.forEach { type ->
             item {
@@ -1430,27 +1770,71 @@ private fun CategoryManagerScreen(state: AutoBookUiState, onSave: (CategoryEntit
                     TextButton(onClick = { addingType = type }) { Text("添加") }
                 }
             }
-            items(state.categories.filter { it.type == type }, key = { it.id }) { category ->
-                CategoryManageRow(category, onEdit = { editing = category }, onDelete = { onDelete(category) })
+            val topCategories = state.categories.filter { it.type == type && it.parentId == null }
+            items(topCategories, key = { it.id }) { category ->
+                val subcategories = state.categories.filter { it.parentId == category.id }
+                val isExpanded = expandedTopId == category.id
+                Column {
+                    CategoryManageRow(
+                        category,
+                        onEdit = { editing = category },
+                        onDelete = { onDelete(category) },
+                        onExpand = if (subcategories.isNotEmpty()) {
+                            { expandedTopId = if (isExpanded) null else category.id }
+                        } else null,
+                        isExpanded = isExpanded,
+                        subCount = subcategories.size,
+                        onAddSub = { addingSubTo = category }
+                    )
+                    if (isExpanded && subcategories.isNotEmpty()) {
+                        Column(Modifier.padding(start = 24.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            subcategories.forEach { sub ->
+                                CategoryManageRow(
+                                    sub,
+                                    onEdit = { editing = sub },
+                                    onDelete = { onDelete(sub) },
+                                    onExpand = null,
+                                    isExpanded = false,
+                                    subCount = 0,
+                                    onAddSub = null
+                                )
+                            }
+                        }
+                    }
+                }
             }
         }
     }
     editing?.let { category ->
-        CategoryEditDialog(category = category, fixedType = category.type, onDismiss = { editing = null }, onSave = { name, type, color, icon ->
-            onSave(category, name, type, color, icon)
+        CategoryEditDialog(category = category, fixedType = category.type, allCategories = state.categories, onDismiss = { editing = null }, onSave = { name, type, color, icon, parentId ->
+            onSave(category, name, type, color, icon, parentId)
             editing = null
         })
     }
     addingType?.let { type ->
-        CategoryEditDialog(category = null, fixedType = type, onDismiss = { addingType = null }, onSave = { name, t, color, icon ->
-            onSave(null, name, t, color, icon)
+        CategoryEditDialog(category = null, fixedType = type, allCategories = state.categories, onDismiss = { addingType = null }, onSave = { name, t, color, icon, parentId ->
+            onSave(null, name, t, color, icon, parentId)
             addingType = null
+        })
+    }
+    addingSubTo?.let { parent ->
+        CategoryEditDialog(category = null, fixedType = parent.type, allCategories = state.categories, defaultParentId = parent.id, onDismiss = { addingSubTo = null }, onSave = { name, t, color, icon, parentId ->
+            onSave(null, name, t, color, icon, parentId ?: parent.id)
+            addingSubTo = null
         })
     }
 }
 
 @Composable
-private fun CategoryManageRow(category: CategoryEntity, onEdit: () -> Unit, onDelete: () -> Unit) {
+private fun CategoryManageRow(
+    category: CategoryEntity,
+    onEdit: () -> Unit,
+    onDelete: () -> Unit,
+    onExpand: (() -> Unit)? = null,
+    isExpanded: Boolean = false,
+    subCount: Int = 0,
+    onAddSub: (() -> Unit)? = null
+) {
     Card(colors = CardDefaults.cardColors(containerColor = CardWhite), shape = RoundedCornerShape(12.dp)) {
         Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
             Box(Modifier.size(42.dp).background(Color(category.color.toInt()).copy(alpha = 0.12f), RoundedCornerShape(12.dp)), contentAlignment = Alignment.Center) {
@@ -1458,7 +1842,26 @@ private fun CategoryManageRow(category: CategoryEntity, onEdit: () -> Unit, onDe
             }
             Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
                 Text(category.name, color = Ink, fontWeight = FontWeight.SemiBold)
-                Text(if (category.isDefault) "默认分类" else "自定义分类", color = Muted, style = MaterialTheme.typography.bodySmall)
+                val subtitle = when {
+                    category.parentId != null -> "子分类"
+                    category.isDefault -> "默认分类"
+                    else -> "自定义分类"
+                }
+                Text(subtitle, color = Muted, style = MaterialTheme.typography.bodySmall)
+            }
+            if (onAddSub != null) {
+                IconButton(onClick = onAddSub) { Icon(Icons.Default.Add, contentDescription = "添加子分类", tint = Blue, modifier = Modifier.size(20.dp)) }
+            }
+            if (onExpand != null) {
+                IconButton(onClick = onExpand) {
+                    Text("$subCount", color = Muted, style = MaterialTheme.typography.bodySmall)
+                    Icon(
+                        if (isExpanded) Icons.Default.ArrowBack else Icons.Default.ArrowForward,
+                        contentDescription = if (isExpanded) "收起" else "展开",
+                        tint = Muted,
+                        modifier = Modifier.size(18.dp)
+                    )
+                }
             }
             IconButton(onClick = onEdit) { Icon(Icons.Default.Edit, contentDescription = "编辑") }
             IconButton(onClick = onDelete) { Icon(Icons.Default.Delete, contentDescription = "删除", tint = Red) }
@@ -1470,13 +1873,25 @@ private fun CategoryManageRow(category: CategoryEntity, onEdit: () -> Unit, onDe
 private fun PendingReviewScreen(
     state: AutoBookUiState,
     onConfirm: (PendingScreenshotReview, String, String, String) -> Unit,
-    onIgnore: (PendingScreenshotReview) -> Unit
+    onIgnore: (PendingScreenshotReview) -> Unit,
+    onClearAllPending: () -> Unit = {}
 ) {
     LazyColumn(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item { EmptyHint("这里用于处理截图 OCR 或自动识别不够确定的消费。确认后才会写入账本，避免误记。") }
         if (state.pending.isEmpty()) {
             item { EmptyHint("暂无待确认截图。上传支付截图后，如果识别结果不够确定，会出现在这里。") }
         } else {
+            item {
+                Button(
+                    onClick = onClearAllPending,
+                    colors = ButtonDefaults.buttonColors(containerColor = Red),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(Icons.Default.Delete, contentDescription = null, tint = Color.White)
+                    Spacer(Modifier.width(8.dp))
+                    Text("全部清空（${state.pending.size}条）", color = Color.White)
+                }
+            }
             items(state.pending, key = { it.id }) { item ->
                 PendingReviewCard(item, state.categories, onConfirm, onIgnore)
             }
@@ -1532,12 +1947,21 @@ private fun TransactionEditDialog(
     var amount by remember(tx.id) { mutableStateOf(formatMoneyPlain(tx.amountCents)) }
     var note by remember(tx.id) { mutableStateOf(tx.note) }
     var merchantInput by remember(tx.id) { mutableStateOf(tx.merchantName) }
+    var editingTime by remember { mutableStateOf(false) }
     var editPaymentApp by remember(tx.id) { mutableStateOf(tx.paymentApp) }
     var paidAt by remember(tx.id) { mutableStateOf(tx.paidAt) }
-    var editingTime by remember { mutableStateOf(false) }
     var showVoucherFull by remember { mutableStateOf(false) }
     var category by remember(tx.id, type) { mutableStateOf(if (categories.any { it.id == tx.categoryId && it.type == type }) tx.categoryId else BuiltInCategories.fallbackFor(type)) }
     val filtered = categories.filter { it.type == type }
+    // categories 异步加载后，修正 category 为 tx 原始值
+    LaunchedEffect(categories, tx.categoryId, type) {
+        if (categories.isNotEmpty()) {
+            val match = categories.firstOrNull { it.id == tx.categoryId && it.type == type }
+            if (match != null && category != tx.categoryId) {
+                category = tx.categoryId
+            }
+        }
+    }
     LaunchedEffect(tx.screenshotId) {
         if (tx.screenshotId != null) onLoadVoucherPreview() else onClearVoucherPreview()
     }
@@ -1554,8 +1978,11 @@ private fun TransactionEditDialog(
                     }
                 }
                 item { OutlinedTextField(value = amount, onValueChange = { amount = it }, label = { Text("金额") }, modifier = Modifier.fillMaxWidth(), singleLine = true) }
-                item { CategoryGrid(filtered, selected = category, onSelect = { category = it }) }
+                item { CategoryGrid(categories.filter { it.type == type || it.parentId != null }, selected = category, onSelect = { category = it }) }
                 item { OutlinedTextField(value = note, onValueChange = { note = it }, label = { Text("备注") }, modifier = Modifier.fillMaxWidth(), singleLine = true) }
+                item {
+                    InfoPill(formatDateTimeShort(paidAt), Icons.Default.CalendarToday, Modifier.fillMaxWidth().clickable { editingTime = true })
+                }
                 item {
                     Card(colors = CardDefaults.cardColors(containerColor = BlueSoft), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
                         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -1715,16 +2142,51 @@ private fun WheelPicker(values: List<Int>, selected: Int, onSelected: (Int) -> U
 }
 
 @Composable
-private fun CategoryEditDialog(category: CategoryEntity?, fixedType: TransactionType, onDismiss: () -> Unit, onSave: (String, TransactionType, Long, String) -> Unit) {
+private fun CategoryEditDialog(
+    category: CategoryEntity?,
+    fixedType: TransactionType,
+    allCategories: List<CategoryEntity> = emptyList(),
+    defaultParentId: String? = null,
+    onDismiss: () -> Unit,
+    onSave: (String, TransactionType, Long, String, String?) -> Unit
+) {
     var name by remember(category?.id) { mutableStateOf(category?.name ?: "") }
     var color by remember(category?.id) { mutableStateOf(category?.color ?: paletteFor(fixedType).first()) }
     var icon by remember(category?.id) { mutableStateOf(category?.icon ?: "Category") }
+    var parentId by remember(category?.id) { mutableStateOf(category?.parentId ?: defaultParentId) }
+    val topCategories = allCategories.filter { it.type == fixedType && it.parentId == null && it.id != category?.id }
     AlertDialog(
         onDismissRequest = onDismiss,
         title = { Text(if (category == null) "添加分类" else "编辑分类") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
                 OutlinedTextField(value = name, onValueChange = { name = it }, label = { Text("分类名称") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+                // Parent category selector
+                if (topCategories.isNotEmpty()) {
+                    Text("父级分类", color = Muted)
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
+                        val noneSelected = parentId == null
+                        Box(
+                            Modifier.background(if (noneSelected) Blue.copy(alpha = 0.12f) else Color.Transparent, RoundedCornerShape(8.dp))
+                                .clickable { parentId = null }
+                                .padding(horizontal = 10.dp, vertical = 6.dp)
+                        ) {
+                            Text("无（顶级）", color = if (noneSelected) Blue else Muted, style = MaterialTheme.typography.bodySmall, fontWeight = if (noneSelected) FontWeight.Bold else FontWeight.Normal)
+                        }
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
+                        topCategories.forEach { top ->
+                            val isSelected = parentId == top.id
+                            Box(
+                                Modifier.background(if (isSelected) Color(top.color.toInt()).copy(alpha = 0.18f) else Color.Transparent, RoundedCornerShape(8.dp))
+                                    .clickable { parentId = top.id }
+                                    .padding(horizontal = 10.dp, vertical = 6.dp)
+                            ) {
+                                Text(top.name, color = if (isSelected) Color(top.color.toInt()) else Muted, style = MaterialTheme.typography.bodySmall, fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal)
+                            }
+                        }
+                    }
+                }
                 Text("颜色", color = Muted)
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     paletteFor(fixedType).forEach { c ->
@@ -1741,7 +2203,7 @@ private fun CategoryEditDialog(category: CategoryEntity?, fixedType: Transaction
                 }
             }
         },
-        confirmButton = { Button(onClick = { onSave(name, fixedType, color, icon) }, colors = ButtonDefaults.buttonColors(containerColor = Blue)) { Text("保存") } },
+        confirmButton = { Button(onClick = { onSave(name, fixedType, color, icon, parentId) }, colors = ButtonDefaults.buttonColors(containerColor = Blue)) { Text("保存") } },
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } }
     )
 }
@@ -1922,19 +2384,23 @@ private fun NotificationRuleManagerScreen(
 private fun AiPromptEditorScreen(
     notificationPrompt: String,
     accessibilityPrompt: String,
+    screenshotPrompt: String,
     defaultNotificationPrompt: String,
     defaultAccessibilityPrompt: String,
+    defaultScreenshotPrompt: String,
     onSaveNotification: (String) -> Unit,
-    onSaveAccessibility: (String) -> Unit
+    onSaveAccessibility: (String) -> Unit,
+    onSaveScreenshot: (String) -> Unit
 ) {
     var selectedTab by remember { mutableStateOf(0) }
     var notifPrompt by remember { mutableStateOf(notificationPrompt.ifBlank { defaultNotificationPrompt }) }
     var a11yPrompt by remember { mutableStateOf(accessibilityPrompt.ifBlank { defaultAccessibilityPrompt }) }
+    var ssPrompt by remember { mutableStateOf(screenshotPrompt.ifBlank { defaultScreenshotPrompt }) }
 
     Column(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         // Tab selector
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            listOf("通知识别", "页面识别").forEachIndexed { idx, label ->
+            listOf("通知识别", "页面识别", "截图补记").forEachIndexed { idx, label ->
                 Text(
                     label,
                     color = if (selectedTab == idx) Blue else Color(0xFF7D8792),
@@ -1948,15 +2414,28 @@ private fun AiPromptEditorScreen(
         }
 
         Text(
-            if (selectedTab == 0) "通知识别提示词（AI开启时，每条通知都会发送给AI分析）"
-            else "页面识别提示词（无障碍服务检测到支付成功页面时调用AI）",
+            when (selectedTab) {
+                0 -> "通知识别提示词（AI开启时，每条通知都会发送给AI分析）"
+                1 -> "页面识别提示词（无障碍服务检测到支付成功页面时调用AI）"
+                else -> "截图补记提示词（上传截图时AI自动识别消费记录）"
+            },
             color = Color(0xFF7D8792),
             style = MaterialTheme.typography.bodySmall
         )
 
         OutlinedTextField(
-            value = if (selectedTab == 0) notifPrompt else a11yPrompt,
-            onValueChange = { if (selectedTab == 0) notifPrompt = it else a11yPrompt = it },
+            value = when (selectedTab) {
+                0 -> notifPrompt
+                1 -> a11yPrompt
+                else -> ssPrompt
+            },
+            onValueChange = {
+                when (selectedTab) {
+                    0 -> notifPrompt = it
+                    1 -> a11yPrompt = it
+                    else -> ssPrompt = it
+                }
+            },
             modifier = Modifier.fillMaxWidth().weight(1f),
             textStyle = MaterialTheme.typography.bodySmall
         )
@@ -1964,14 +2443,22 @@ private fun AiPromptEditorScreen(
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedButton(
                 onClick = {
-                    if (selectedTab == 0) notifPrompt = defaultNotificationPrompt else a11yPrompt = defaultAccessibilityPrompt
+                    when (selectedTab) {
+                        0 -> notifPrompt = defaultNotificationPrompt
+                        1 -> a11yPrompt = defaultAccessibilityPrompt
+                        else -> ssPrompt = defaultScreenshotPrompt
+                    }
                 },
                 shape = RoundedCornerShape(10.dp),
                 modifier = Modifier.weight(1f)
             ) { Text("恢复默认") }
             Button(
                 onClick = {
-                    if (selectedTab == 0) onSaveNotification(notifPrompt) else onSaveAccessibility(a11yPrompt)
+                    when (selectedTab) {
+                        0 -> onSaveNotification(notifPrompt)
+                        1 -> onSaveAccessibility(a11yPrompt)
+                        else -> onSaveScreenshot(screenshotPrompt)
+                    }
                 },
                 shape = RoundedCornerShape(10.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = Blue),
@@ -2178,7 +2665,8 @@ private fun UsageGuideDialog(aiEnabled: Boolean, onDismiss: () -> Unit) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                     Text("功能说明", color = Ink, fontWeight = FontWeight.Bold)
                     Text("通知监听：开启后自动读取支付 App 的通知，解析金额和商户并自动记账。", color = Muted, style = MaterialTheme.typography.bodySmall)
-                    Text("无障碍辅助：AI 模式下自动识别支付成功页面文本。", color = Muted, style = MaterialTheme.typography.bodySmall)
+                    Text("无障碍辅助：当前不主动自动记账，避免浏览误触发。", color = Muted, style = MaterialTheme.typography.bodySmall)
+                    Text("截图记账：支付后你自己截图，系统会自动识别并保存凭证。", color = Muted, style = MaterialTheme.typography.bodySmall)
                     Text("截图补记：手动导入支付截图，通过本地 OCR 和 AI 识别后自动记账。", color = Muted, style = MaterialTheme.typography.bodySmall)
                     Text("账单导入：导入微信、支付宝、京东等 CSV/TXT 账单文件。", color = Muted, style = MaterialTheme.typography.bodySmall)
                 }

@@ -9,18 +9,67 @@ enum class PaymentApp(val label: String, val packages: Set<String>) {
     WECHAT("微信支付", setOf("com.tencent.mm")),
     ALIPAY("支付宝", setOf("com.eg.android.AlipayGphone")),
     UNION_PAY("云闪付", setOf("com.unionpay", "com.unionpay.tsmservice")),
-    JD("京东支付", setOf("com.jingdong.app.mall", "com.jd.jrapp")),
-    DOUYIN("抖音支付", setOf("com.ss.android.ugc.aweme")),
-    TAOBAO("淘宝", setOf("com.taobao.taobao")),
+    JD("京东支付", setOf("com.jingdong.app.mall", "com.jd.jrapp", "com.jingdong.app")),
+    DOUYIN("抖音支付", setOf("com.ss.android.ugc.aweme", "com.ss.android.ugc.aweme.lite")),
+    TAOBAO("淘宝", setOf("com.taobao.taobao", "com.taobao.litetao")),
     TMALL("天猫", setOf("com.tmall.wireless")),
     PINDUODUO("拼多多", setOf("com.xunmeng.pinduoduo")),
-    MEITUAN("美团", setOf("com.sankuai.meituan", "com.meituan.android.generalcategories")),
+    MEITUAN("美团", setOf(
+        "com.sankuai.meituan",
+        "com.meituan.android.generalcategories",
+        "com.sankuai.meituan.takeoutnew"
+    )),
     UNKNOWN("未知", emptySet());
 
     companion object {
-        fun fromPackage(packageName: String?): PaymentApp = entries.firstOrNull { app ->
-            packageName != null && packageName in app.packages
-        } ?: UNKNOWN
+        fun fromPackage(packageName: String?): PaymentApp {
+            if (packageName.isNullOrBlank()) return UNKNOWN
+            entries.firstOrNull { packageName in it.packages }?.let { return it }
+            val lower = packageName.lowercase()
+            return when {
+                lower.contains("tencent.mm") -> WECHAT
+                lower.contains("alipay") -> ALIPAY
+                lower.contains("unionpay") -> UNION_PAY
+                lower.contains("jingdong") || lower.contains("com.jd.") || lower.startsWith("com.jd") -> JD
+                lower.contains("aweme") || lower.contains("douyin") -> DOUYIN
+                lower.contains("taobao") -> TAOBAO
+                lower.contains("tmall") -> TMALL
+                lower.contains("pinduoduo") || lower.contains("xunmeng") -> PINDUODUO
+                lower.contains("meituan") || lower.contains("sankuai") -> MEITUAN
+                else -> UNKNOWN
+            }
+        }
+
+        /** 从截图文件名解析包名，如 Screenshot_..._com.jingdong.app.mall.jpg */
+        fun packageFromScreenshotName(name: String?): String? {
+            if (name.isNullOrBlank()) return null
+            // Screenshot_2026-07-24-20-04-13-042_com.jingdong.app.mall.jpg
+            val m = Regex(
+                """(?:Screenshot|screenshot|截图|截屏)[^_]*_(?:\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}(?:-\d+)?)_(.+?)\.(?:jpg|jpeg|png|webp)$""",
+                RegexOption.IGNORE_CASE
+            ).find(name)
+            if (m != null) return m.groupValues[1]
+            val m2 = Regex("""(com\.[A-Za-z0-9_.]+)\.(?:jpg|jpeg|png|webp)$""", RegexOption.IGNORE_CASE).find(name)
+            return m2?.groupValues?.getOrNull(1)
+        }
+
+        /** 从截图文件名解析时间：yyyy-MM-dd-HH-mm-ss */
+        fun timeFromScreenshotName(name: String?): Long? {
+            if (name.isNullOrBlank()) return null
+            val m = Regex("""(\d{4})-(\d{2})-(\d{2})-(\d{2})-(\d{2})-(\d{2})(?:-\d+)?""").find(name) ?: return null
+            return runCatching {
+                val y = m.groupValues[1].toInt()
+                val mo = m.groupValues[2].toInt()
+                val d = m.groupValues[3].toInt()
+                val h = m.groupValues[4].toInt()
+                val mi = m.groupValues[5].toInt()
+                val s = m.groupValues[6].toInt()
+                java.time.LocalDateTime.of(y, mo, d, h, mi, s)
+                    .atZone(java.time.ZoneId.systemDefault())
+                    .toInstant()
+                    .toEpochMilli()
+            }.getOrNull()
+        }
     }
 }
 
@@ -29,7 +78,7 @@ enum class ScreenshotSourceType { MANUAL_UPLOAD, AUTO_CAPTURE }
 enum class ScreenshotStatus { PENDING_REVIEW, CONFIRMED, IGNORED }
 enum class TransactionType(val label: String) { EXPENSE("支出"), INCOME("收入"), OTHER("其他") }
 
-@Entity(tableName = "categories", indices = [Index(value = ["type", "sortOrder"])])
+@Entity(tableName = "categories", indices = [Index(value = ["type", "sortOrder"]), Index(value = ["parentId"])])
 data class CategoryEntity(
     @PrimaryKey val id: String,
     val name: String,
@@ -37,7 +86,8 @@ data class CategoryEntity(
     val color: Long,
     val sortOrder: Int,
     val type: TransactionType = TransactionType.EXPENSE,
-    val isDefault: Boolean = true
+    val isDefault: Boolean = true,
+    val parentId: String? = null
 )
 
 @Entity(
@@ -117,6 +167,7 @@ data class ParsedPayment(
     val rawText: String,
     val type: TransactionType = TransactionType.EXPENSE,
     val categoryHint: String = "",
+    val note: String = "",
     val isSpam: Boolean = false
 )
 
@@ -194,6 +245,30 @@ object BuiltInCategories {
     const val WITHDRAW = "withdraw"
     const val OTHER_MISC = "other_misc"
 
+    // 二级分类 ID
+    const val FOOD_BREAKFAST = "food_breakfast"
+    const val FOOD_LUNCH = "food_lunch"
+    const val FOOD_DINNER = "food_dinner"
+    const val FOOD_TAKEOUT = "food_takeout"
+    const val FOOD_SNACK = "food_snack"
+    const val FOOD_FRUIT = "food_fruit"
+    const val TRANSPORT_BUS = "transport_bus"
+    const val TRANSPORT_TAXI = "transport_taxi"
+    const val TRANSPORT_METRO = "transport_metro"
+    const val TRANSPORT_FUEL = "transport_fuel"
+    const val TRANSPORT_PARKING = "transport_parking"
+    const val BILLS_WATER = "bills_water"
+    const val BILLS_ELECTRIC = "bills_electric"
+    const val BILLS_GAS = "bills_gas"
+    const val BILLS_RENT = "bills_rent"
+    const val BILLS_INTERNET = "bills_internet"
+    const val ENTERTAINMENT_GAME = "entertainment_game"
+    const val ENTERTAINMENT_MOVIE = "entertainment_movie"
+    const val ENTERTAINMENT_SPORT = "entertainment_sport"
+    const val SHOPPING_CLOTHES = "shopping_clothes"
+    const val SHOPPING_DAILY = "shopping_daily"
+    const val SHOPPING_DIGITAL = "shopping_digital"
+
     val defaults = listOf(
         CategoryEntity(FOOD, "餐饮", "Restaurant", 0xFFE85D4FL, 10, TransactionType.EXPENSE),
         CategoryEntity(TRANSPORT, "交通", "DirectionsCar", 0xFF2F80EDL, 20, TransactionType.EXPENSE),
@@ -209,7 +284,34 @@ object BuiltInCategories {
         CategoryEntity(REFUND, "退款", "AssignmentReturn", 0xFFFF9F43L, 20, TransactionType.INCOME),
         CategoryEntity(BONUS, "奖金", "CardGiftcard", 0xFFF4A340L, 30, TransactionType.INCOME),
         CategoryEntity(FINANCE, "理财", "Savings", 0xFFE5A244L, 40, TransactionType.INCOME),
-        CategoryEntity(INCOME_OTHER, "其他收入", "MoreHoriz", 0xFFDA8F2DL, 90, TransactionType.INCOME)
+        CategoryEntity(INCOME_OTHER, "其他收入", "MoreHoriz", 0xFFDA8F2DL, 90, TransactionType.INCOME),
+        // 餐饮子分类
+        CategoryEntity(FOOD_BREAKFAST, "早餐", "FreeBreakfast", 0xFFE85D4FL, 11, TransactionType.EXPENSE, parentId = FOOD),
+        CategoryEntity(FOOD_LUNCH, "午餐", "Restaurant", 0xFFE85D4FL, 12, TransactionType.EXPENSE, parentId = FOOD),
+        CategoryEntity(FOOD_DINNER, "晚餐", "Dining", 0xFFE85D4FL, 13, TransactionType.EXPENSE, parentId = FOOD),
+        CategoryEntity(FOOD_TAKEOUT, "外卖", "DeliveryDining", 0xFFE85D4FL, 14, TransactionType.EXPENSE, parentId = FOOD),
+        CategoryEntity(FOOD_SNACK, "零食", "Cookie", 0xFFE85D4FL, 15, TransactionType.EXPENSE, parentId = FOOD),
+        CategoryEntity(FOOD_FRUIT, "水果", "Spa", 0xFFE85D4FL, 16, TransactionType.EXPENSE, parentId = FOOD),
+        // 交通子分类
+        CategoryEntity(TRANSPORT_BUS, "公交", "DirectionsBus", 0xFF2F80EDL, 21, TransactionType.EXPENSE, parentId = TRANSPORT),
+        CategoryEntity(TRANSPORT_TAXI, "打车", "LocalTaxi", 0xFF2F80EDL, 22, TransactionType.EXPENSE, parentId = TRANSPORT),
+        CategoryEntity(TRANSPORT_METRO, "地铁", "Subway", 0xFF2F80EDL, 23, TransactionType.EXPENSE, parentId = TRANSPORT),
+        CategoryEntity(TRANSPORT_FUEL, "加油", "LocalGasStation", 0xFF2F80EDL, 24, TransactionType.EXPENSE, parentId = TRANSPORT),
+        CategoryEntity(TRANSPORT_PARKING, "停车", "LocalParking", 0xFF2F80EDL, 25, TransactionType.EXPENSE, parentId = TRANSPORT),
+        // 生活缴费子分类
+        CategoryEntity(BILLS_WATER, "水费", "WaterDrop", 0xFF6F52EDL, 41, TransactionType.EXPENSE, parentId = BILLS),
+        CategoryEntity(BILLS_ELECTRIC, "电费", "Bolt", 0xFF6F52EDL, 42, TransactionType.EXPENSE, parentId = BILLS),
+        CategoryEntity(BILLS_GAS, "燃气", "LocalFireDepartment", 0xFF6F52EDL, 43, TransactionType.EXPENSE, parentId = BILLS),
+        CategoryEntity(BILLS_RENT, "房租", "Home", 0xFF6F52EDL, 44, TransactionType.EXPENSE, parentId = BILLS),
+        CategoryEntity(BILLS_INTERNET, "网费", "Wifi", 0xFF6F52EDL, 45, TransactionType.EXPENSE, parentId = BILLS),
+        // 娱乐子分类
+        CategoryEntity(ENTERTAINMENT_GAME, "游戏", "SportsEsports", 0xFFE0528DL, 51, TransactionType.EXPENSE, parentId = ENTERTAINMENT),
+        CategoryEntity(ENTERTAINMENT_MOVIE, "电影", "Movie", 0xFFE0528DL, 52, TransactionType.EXPENSE, parentId = ENTERTAINMENT),
+        CategoryEntity(ENTERTAINMENT_SPORT, "运动", "FitnessCenter", 0xFFE0528DL, 53, TransactionType.EXPENSE, parentId = ENTERTAINMENT),
+        // 购物子分类
+        CategoryEntity(SHOPPING_CLOTHES, "服装", "Checkroom", 0xFFD98B2BL, 31, TransactionType.EXPENSE, parentId = SHOPPING),
+        CategoryEntity(SHOPPING_DAILY, "日用品", "CleaningServices", 0xFFD98B2BL, 32, TransactionType.EXPENSE, parentId = SHOPPING),
+        CategoryEntity(SHOPPING_DIGITAL, "数码", "Devices", 0xFFD98B2BL, 33, TransactionType.EXPENSE, parentId = SHOPPING),
     )
 
     fun fallbackFor(type: TransactionType): String = when (type) {

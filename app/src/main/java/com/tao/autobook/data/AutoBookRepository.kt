@@ -9,6 +9,7 @@ import com.tao.autobook.ai.AiRecognitionConfig
 import com.tao.autobook.ai.AiRecognitionSettings
 import com.tao.autobook.ai.AiScreenshotRecognizer
 import com.tao.autobook.ai.AiSettingsStore
+import com.tao.autobook.storage.SecurePrefs
 import com.tao.autobook.data.AutoBookLogEntry
 import com.tao.autobook.data.NotificationRuleEntity
 import com.tao.autobook.data.NotificationMatchType
@@ -21,16 +22,23 @@ import com.tao.autobook.storage.CryptoStore
 import com.tao.autobook.storage.ScreenshotStorage
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import java.io.File
 import java.nio.charset.Charset
 import java.time.Instant
 import java.time.ZoneId
 
+private const val TAG = "AutoBook"
 private const val LOCAL_AUTO_CONFIRM_CONFIDENCE = 0.78f
 private const val AI_AUTO_IMPORT_CONFIDENCE = 0.50f
 private const val DEDUP_WINDOW_MS: Long = 300_000L
 private const val LOG_RETENTION_MS: Long = 30L * 24 * 60 * 60 * 1000
+private const val LEDGER_DISPLAY_LIMIT = 500
+private const val CHAT_CONTEXT_LIMIT = 100
+/** 单笔最大金额：1亿人民币（分）。超此视为脏数据 */
+private const val MAX_AMOUNT_CENTS: Long = 10_000_000_000L // 1e8 元 * 100
 
 class AutoBookRepository(
     private val context: Context,
@@ -43,17 +51,27 @@ class AutoBookRepository(
     private val cryptoStore: CryptoStore = CryptoStore(),
     private val ocrRecognizer: OcrRecognizer = OcrRecognizer(),
     private val aiSettingsStore: AiSettingsStore = AiSettingsStore(context),
-    private val aiRecognizer: AiScreenshotRecognizer = AiScreenshotRecognizer()
+    private val aiRecognizer: AiScreenshotRecognizer = AiScreenshotRecognizer(),
+    private val securePrefs: SecurePrefs = SecurePrefs(context)
 ) {
+    private val aiMutex = Mutex()
+    private var lastAiCallTime = 0L
 
-    val transactions: Flow<List<TransactionEntity>> = dao.observeTransactions()
+    val transactions: Flow<List<TransactionEntity>> = dao.observeRecentTransactions(LEDGER_DISPLAY_LIMIT)
     val categories: Flow<List<CategoryEntity>> = dao.observeCategories()
     val pendingScreenshots: Flow<List<ScreenshotCaptureEntity>> = dao.observeScreenshotsByStatus(ScreenshotStatus.PENDING_REVIEW)
     val aiSettings: Flow<AiRecognitionSettings> = aiSettingsStore.settings
 
     suspend fun initialize() {
-        dao.seedCategoriesIfEmpty()
-    }
+            dao.seedCategoriesIfEmpty()
+            // 清理离谱金额（AI/导入误把元当分或超大数），避免启动统计 SUM integer overflow 闪退
+            runCatching {
+                val fixed = dao.sanitizeOutlierAmounts(MAX_AMOUNT_CENTS, System.currentTimeMillis())
+                if (fixed > 0) {
+                    addLog("数据修复", "清理异常金额", "共 $fixed 条 amountCents 超限已置 0")
+                }
+            }
+        }
 
     suspend fun getTransaction(id: Long): TransactionEntity? = withContext(Dispatchers.IO) { dao.getTransaction(id) }
 
@@ -88,6 +106,7 @@ class AutoBookRepository(
 
         val app = PaymentApp.fromPackage(packageName)
         val aiConfig = aiSettingsStore.loadConfig()
+        android.util.Log.d(TAG, "AI配置: enabled=${aiConfig.enabled}, configured=${aiConfig.configured}, url=${aiConfig.apiUrl.take(30)}, model=${aiConfig.model}")
 
         // ====== AI开启：先本地预过滤，再过AI ======
         if (aiConfig.configured) {
@@ -99,18 +118,44 @@ class AutoBookRepository(
                 return@withContext CaptureResult(null, false)
             }
 
-            // 本地解析作为预处理（提取金额/商户供AI参考）
-            val localParsed = parser.parse(raw, packageName)
+            // 黑名单：含这些词的通知直接跳过，不浪费AI调用
+            val blacklist = listOf(
+                "签到", "邀请", "活动", "抽奖", "优惠券", "红包领取",
+                "社保", "社保卡", "医保卡",
+                "人民币", "您有", "到账通知", "余额变动",
+                "验证码", "校验码", "动态码", "登录验证",
+                "还款提醒", "账单提醒", "出账", "最低还款",
+                "物流", "发货", "签收", "派送", "取件",
+                "评价", "晒单", "售后", "退款申请",
+                "信用", "额度", "提额", "借款", "贷款"
+            )
+            if (blacklist.any { raw.contains(it) }) {
+                addLog("通知监听", "黑名单过滤", raw.take(100))
+                return@withContext CaptureResult(null, false)
+            }
 
-            // 调用AI分析
-            val aiResult = recognizeNotificationWithAi(raw, localParsed ?: ParsedPayment(
-                amountCents = 0, merchantName = "", paymentApp = app,
-                paidAt = System.currentTimeMillis(), confidence = 0f,
-                rawText = raw, type = TransactionType.EXPENSE
-            )).getOrNull()
+            // 直接把原始通知文本给AI分析，不做本地预解析
+            val aiResult = recognizeNotificationWithAi(raw).getOrNull()
 
             if (aiResult == null) {
-                addLog("通知监听", "AI调用失败，跳过", raw.take(100))
+                // AI未返回结果，用本地解析器兜底
+                val localParsed = parser.parse(raw, packageName)
+                if (localParsed != null && localParsed.amountCents > 0) {
+                    addLog("通知监听", "AI未返回结果，本地兜底", "${localParsed.merchantName} ¥${localParsed.amountCents / 100.0}")
+                    val result = upsertParsedPayment(localParsed, SourceType.NOTIFICATION, null)
+                    if (result.created) {
+                        addLog("通知监听", "本地兜底记账成功", "${localParsed.merchantName} ¥${localParsed.amountCents / 100.0}")
+                    }
+                    dao.insertRawCapture(RawCaptureEntity(
+                        sourceType = SourceType.NOTIFICATION, paymentApp = app,
+                        capturedAt = System.currentTimeMillis(),
+                        titleHash = stableSha256(title.orEmpty()),
+                        textHash = stableSha256(text.orEmpty()),
+                        parsedTransactionId = result.transaction?.id
+                    ))
+                    return@withContext result
+                }
+                addLog("通知监听", "AI未返回结果，本地也无法解析，跳过", raw.take(80))
                 dao.insertRawCapture(RawCaptureEntity(
                     sourceType = SourceType.NOTIFICATION, paymentApp = app,
                     capturedAt = System.currentTimeMillis(),
@@ -128,7 +173,7 @@ class AutoBookRepository(
 
             // 再转为ParsedPayment
             val parsed = aiResult.toLocalParsed(
-                localParsed ?: ParsedPayment(
+                ParsedPayment(
                     amountCents = 0, merchantName = "", paymentApp = app,
                     paidAt = System.currentTimeMillis(), confidence = 0f,
                     rawText = raw, type = TransactionType.EXPENSE
@@ -239,12 +284,29 @@ class AutoBookRepository(
     }
 
 
-    suspend fun importScreenshot(uri: Uri): Long = withContext(Dispatchers.IO) {
-        val stored = screenshotStorage.saveEncryptedFromUri(uri)
-        val bitmap = screenshotStorage.loadBitmap(stored.encryptedPath)
-        val ocrText = bitmap?.let { ocrRecognizer.recognize(it) }.orEmpty()
-        createScreenshotRecord(stored.encryptedPath, ScreenshotSourceType.MANUAL_UPLOAD, ocrText, bitmap).first
-    }
+    suspend fun importScreenshot(
+                uri: Uri,
+                displayName: String? = null,
+                capturedAtMs: Long? = null
+            ): Long = withContext(Dispatchers.IO) {
+                // 手动导入若未传文件名，从 URI 取 DISPLAY_NAME，便于解析包名/时间
+                val resolvedName = displayName?.takeIf { it.isNotBlank() } ?: displayName(uri).takeIf { it.isNotBlank() }
+                val stored = screenshotStorage.saveEncryptedFromUri(uri)
+                val bitmap = screenshotStorage.loadBitmap(stored.encryptedPath)
+                try {
+                    val ocrText = bitmap?.let { ocrRecognizer.recognize(it) }.orEmpty()
+                    createScreenshotRecord(
+                        path = stored.encryptedPath,
+                        source = ScreenshotSourceType.MANUAL_UPLOAD,
+                        ocrText = ocrText,
+                        bitmap = bitmap,
+                        displayName = resolvedName,
+                        capturedAtMs = capturedAtMs
+                    ).first
+                } finally {
+                    bitmap?.recycle()
+                }
+            }
 
     suspend fun attachScreenshotToTransaction(transactionId: Long, uri: Uri): Long = withContext(Dispatchers.IO) {
         val transaction = dao.getTransaction(transactionId) ?: error("账单不存在")
@@ -415,6 +477,13 @@ class AutoBookRepository(
         return txId
     }
 
+    suspend fun clearAllPendingScreenshots() = withContext(Dispatchers.IO) {
+        val screenshots = dao.getUnconfirmedScreenshots()
+        screenshots.forEach { screenshotStorage.delete(it.encryptedFilePath) }
+        dao.deleteUnconfirmedScreenshots()
+        screenshots.size
+    }
+
     suspend fun ignorePendingScreenshot(screenshotId: Long) = withContext(Dispatchers.IO) {
         val screenshot = dao.getScreenshot(screenshotId) ?: return@withContext
         if (screenshot.status == ScreenshotStatus.PENDING_REVIEW) {
@@ -423,25 +492,38 @@ class AutoBookRepository(
     }
 
     suspend fun buildPendingReviews(items: List<ScreenshotCaptureEntity>): List<PendingScreenshotReview> = withContext(Dispatchers.IO) {
-        val rules = dao.getMerchantRules()
-        items.map { screenshot ->
-            val rawText = runCatching { cryptoStore.decryptFromString(screenshot.ocrRawTextEncrypted) }.getOrDefault("")
-            val ai = extractAiSuggestion(rawText)
-            val parsed = ai?.toParsedPayment() ?: parser.parse(rawText)
-            val category = parsed?.let { chooseCategory(it, rules) } ?: BuiltInCategories.OTHER
-            PendingScreenshotReview(
-                id = screenshot.id,
-                capturedAt = screenshot.capturedAt,
-                sourceType = screenshot.sourceType,
-                ocrPreview = buildPendingPreview(rawText, ai),
-                suggestedMerchant = parsed?.merchantName?.takeIf { it != "未识别商户" } ?: "截图消费",
-                suggestedAmountCents = parsed?.amountCents,
-                suggestedCategoryId = category,
-                suggestedPaymentApp = parsed?.paymentApp ?: PaymentApp.UNKNOWN,
-                confidence = parsed?.confidence ?: 0.2f
-            )
+            val rules = dao.getMerchantRules()
+            items.map { screenshot ->
+                val rawText = runCatching { cryptoStore.decryptFromString(screenshot.ocrRawTextEncrypted) }.getOrDefault("")
+                // 待确认页也从 OCR 元数据兜底支付App/时间（文件名包名已写入 OCR）
+                val pkgFromMeta = Regex("""截图来源应用包名：([^\s\n]+)""").find(rawText)?.groupValues?.getOrNull(1)
+                val appFromMeta = PaymentApp.fromPackage(pkgFromMeta)
+                val fileName = Regex("""截图文件名：([^\n]+)""").find(rawText)?.groupValues?.getOrNull(1)
+                val appFromName = PaymentApp.fromPackage(PaymentApp.packageFromScreenshotName(fileName))
+                val fallbackApp = if (appFromMeta != PaymentApp.UNKNOWN) appFromMeta else appFromName
+                val fallbackPaidAt = screenshot.capturedAt.takeIf { it > 0 } ?: System.currentTimeMillis()
+                val ai = extractAiSuggestion(rawText)
+                val parsed = (ai?.toParsedPayment(fallbackApp = fallbackApp, fallbackPaidAt = fallbackPaidAt)
+                    ?: parser.parse(rawText)?.let { local ->
+                        local.copy(
+                            paymentApp = if (local.paymentApp == PaymentApp.UNKNOWN && fallbackApp != PaymentApp.UNKNOWN) fallbackApp else local.paymentApp,
+                            paidAt = if (local.paidAt <= 0) fallbackPaidAt else local.paidAt
+                        )
+                    })
+                val category = parsed?.let { chooseCategory(it, rules) } ?: BuiltInCategories.OTHER
+                PendingScreenshotReview(
+                    id = screenshot.id,
+                    capturedAt = screenshot.capturedAt,
+                    sourceType = screenshot.sourceType,
+                    ocrPreview = buildPendingPreview(rawText, ai),
+                    suggestedMerchant = parsed?.merchantName?.takeIf { it != "未识别商户" } ?: "截图消费",
+                    suggestedAmountCents = parsed?.amountCents,
+                    suggestedCategoryId = category,
+                    suggestedPaymentApp = parsed?.paymentApp ?: fallbackApp,
+                    confidence = parsed?.confidence ?: 0.2f
+                )
+            }
         }
-    }
 
     suspend fun addManualTransaction(
         merchant: String,
@@ -528,11 +610,21 @@ class AutoBookRepository(
     }
 
     suspend fun deleteTransaction(id: Long) = dao.deleteTransaction(id)
+
     suspend fun deleteTransactionWithImages(id: Long) = withContext(Dispatchers.IO) {
         val screenshots = dao.getScreenshotsByTransactionId(id)
         screenshots.forEach { screenshotStorage.delete(it.encryptedFilePath) }
         dao.deleteScreenshotsByTransactionId(id)
         dao.deleteTransaction(id)
+    }
+
+    suspend fun deleteTransactionsWithImages(ids: Collection<Long>) = withContext(Dispatchers.IO) {
+        if (ids.isEmpty()) return@withContext
+        val idList = ids.toList()
+        val screenshots = dao.getScreenshotsByTransactionIds(idList)
+        screenshots.forEach { screenshotStorage.delete(it.encryptedFilePath) }
+        dao.deleteScreenshotsByTransactionIds(idList)
+        dao.deleteTransactions(idList)
     }
 
     suspend fun upsertCategory(category: CategoryEntity) = withContext(Dispatchers.IO) {
@@ -702,105 +794,304 @@ class AutoBookRepository(
         return id > 0
     }
 
-    private suspend fun createScreenshotRecord(path: String, source: ScreenshotSourceType, ocrText: String, bitmap: Bitmap? = null): Pair<Long, CaptureResult> {
-        val aiConfig = aiSettingsStore.loadConfig()
+    private suspend fun createScreenshotRecord(
+            path: String,
+            source: ScreenshotSourceType,
+            ocrText: String,
+            bitmap: Bitmap? = null,
+            displayName: String? = null,
+            capturedAtMs: Long? = null
+        ): Pair<Long, CaptureResult> {
+            val aiConfig = aiSettingsStore.loadConfig()
+            val pkgFromName = PaymentApp.packageFromScreenshotName(displayName)
+            val appFromName = PaymentApp.fromPackage(pkgFromName)
+            val timeFromName = PaymentApp.timeFromScreenshotName(displayName)
+            val captureTime = capturedAtMs?.takeIf { it > 0 }
+                ?: timeFromName
+                ?: System.currentTimeMillis()
 
-        // 截图补记一律使用AI识别
-        val aiAttempt = if (bitmap != null) recognizeWithAi(bitmap, ocrText) else null
-        val ai = aiAttempt?.getOrNull()
-
-        val storedText = combineOcrAndAi(ocrText, ai, aiAttempt?.exceptionOrNull()?.message)
-        val screenshotId = dao.insertScreenshot(
-            ScreenshotCaptureEntity(
-                encryptedFilePath = path,
-                sourceType = source,
-                capturedAt = System.currentTimeMillis(),
-                ocrTextHash = stableSha256(storedText),
-                ocrRawTextEncrypted = cryptoStore.encryptToString(storedText),
-                status = ScreenshotStatus.PENDING_REVIEW
-            )
-        )
-
-        // AI成功识别且可自动入账
-        val parsed = if (ai != null && ai.canAutoImport()) {
-            ai.toParsedPayment()
-        } else {
-            // AI未配置或失败时，使用本地OCR解析
-            parser.parse(ocrText)
-        }
-
-        if (parsed != null && (ai != null || parser.parse(ocrText)?.confidence ?: 0f >= LOCAL_AUTO_CONFIRM_CONFIDENCE)) {
-            val result = upsertParsedPayment(parsed, SourceType.SCREENSHOT, screenshotId)
-            dao.getScreenshot(screenshotId)?.let { dao.updateScreenshot(it.copy(parsedTransactionId = result.transaction?.id, status = ScreenshotStatus.CONFIRMED)) }
-            if (result.created) {
-                addLog("截图补记", "自动记账成功", "${parsed.merchantName} ¥${parsed.amountCents / 100.0}")
+            // 把截图元数据塞进 OCR 文本，给 AI / 本地解析更多上下文
+            val metaLines = buildList {
+                if (!displayName.isNullOrBlank()) add("截图文件名：$displayName")
+                if (!pkgFromName.isNullOrBlank()) add("截图来源应用包名：$pkgFromName")
+                if (appFromName != PaymentApp.UNKNOWN) add("截图来源支付App：${appFromName.label}")
+                add("截图时间：${java.time.Instant.ofEpochMilli(captureTime).atZone(java.time.ZoneId.systemDefault()).toLocalDateTime()}")
             }
-            return screenshotId to result
+            val enrichedOcr = (metaLines.joinToString("\n") + "\n" + ocrText).trim()
+
+            // 先跑本地 OCR，再把 OCR 文本和压缩截图一起给 AI。
+            // 这样即使模型视觉能力弱，也能从 OCR 文本中提取金额。
+            val aiAttempt = if (bitmap != null && aiConfig.configured) {
+                recognizeWithAi(bitmap, enrichedOcr)
+            } else {
+                null
+            }
+            val ai = aiAttempt?.getOrNull()
+            val aiError = aiAttempt?.exceptionOrNull()?.message
+            if (!aiError.isNullOrBlank()) {
+                addLog("截图补记", "AI识别失败，本地OCR兜底", aiError.take(180))
+            } else if (ai != null && !ai.canAutoImport()) {
+                val reason = listOfNotNull(
+                    ai.reason.takeIf { it.isNotBlank() },
+                    ai.amountCents?.let { "¥${it / 100.0}" },
+                    "confidence=${ai.confidence}"
+                ).joinToString(" / ")
+                addLog("截图补记", "AI识别不确定，本地OCR兜底", reason.take(180))
+            }
+
+            val storedText = combineOcrAndAi(enrichedOcr, ai, aiError)
+            val screenshotId = dao.insertScreenshot(
+                ScreenshotCaptureEntity(
+                    encryptedFilePath = path,
+                    sourceType = source,
+                    capturedAt = captureTime,
+                    ocrTextHash = stableSha256(storedText),
+                    ocrRawTextEncrypted = cryptoStore.encryptToString(storedText),
+                    status = ScreenshotStatus.PENDING_REVIEW
+                )
+            )
+
+            val localParsed = parser.parse(enrichedOcr)?.let { local ->
+                // 本地解析也用文件名元数据补支付App/时间
+                local.copy(
+                    paymentApp = if (local.paymentApp == PaymentApp.UNKNOWN && appFromName != PaymentApp.UNKNOWN) appFromName else local.paymentApp,
+                    paidAt = if (local.paidAt <= 0) captureTime else local.paidAt
+                )
+            }
+
+            // 本地先拦聊天/非支付截图，避免“我已经付款了”这类会话误入账
+            if (looksLikeChatOrNonPaymentScreenshot(enrichedOcr, ai)) {
+                addLog("截图补记", "非支付截图，跳过自动入账", enrichedOcr.take(80))
+                return screenshotId to CaptureResult(null, false)
+            }
+
+            // AI成功识别且可自动入账
+            val parsed = if (ai != null && ai.canAutoImport()) {
+                ai.toParsedPayment(fallbackApp = appFromName, fallbackPaidAt = captureTime)
+            } else {
+                // AI未配置或失败时，使用本地OCR解析
+                localParsed
+            }?.let { p ->
+                // 最终兜底：支付App / 时间 / 分类
+                val app = if (p.paymentApp == PaymentApp.UNKNOWN && appFromName != PaymentApp.UNKNOWN) appFromName else p.paymentApp
+                val paidAt = if (p.paidAt <= 0) captureTime else p.paidAt
+                // 京东外卖/美团外卖等：OCR 含外卖关键词时，分类偏向餐饮
+                val categoryHint = when {
+                    p.categoryHint.isNotBlank() -> p.categoryHint
+                    enrichedOcr.contains("外卖") || enrichedOcr.contains("骑手") || enrichedOcr.contains("送达") -> "餐饮"
+                    app == PaymentApp.JD && (enrichedOcr.contains("外卖") || enrichedOcr.contains("合计")) -> "餐饮"
+                    app == PaymentApp.MEITUAN -> "餐饮"
+                    app == PaymentApp.PINDUODUO || app == PaymentApp.TAOBAO || app == PaymentApp.TMALL || app == PaymentApp.JD -> "购物"
+                    else -> p.categoryHint
+                }
+                p.copy(paymentApp = app, paidAt = paidAt, categoryHint = categoryHint)
+            }
+
+            val canAutoConfirm = if (ai != null && ai.canAutoImport()) {
+                true
+            } else {
+                (localParsed?.confidence ?: 0f) >= LOCAL_AUTO_CONFIRM_CONFIDENCE
+            }
+            if (parsed != null && canAutoConfirm) {
+                val result = upsertParsedPayment(parsed, SourceType.SCREENSHOT, screenshotId)
+                dao.getScreenshot(screenshotId)?.let {
+                    dao.updateScreenshot(
+                        it.copy(
+                            parsedTransactionId = result.transaction?.id,
+                            status = if (result.transaction != null) ScreenshotStatus.CONFIRMED else ScreenshotStatus.PENDING_REVIEW
+                        )
+                    )
+                }
+                if (result.created) {
+                    addLog(
+                        "截图补记",
+                        "自动记账成功",
+                        "${parsed.merchantName} ¥${parsed.amountCents / 100.0} [${parsed.paymentApp.label}]"
+                    )
+                } else if (result.transaction != null) {
+                    addLog("截图合并", "已合并到已有账单并补充凭证", "#${result.transaction.id} ${result.transaction.merchantName}")
+                }
+                return screenshotId to result
+            }
+            return screenshotId to CaptureResult(null, false)
         }
-        return screenshotId to CaptureResult(null, false)
-    }
 
     private suspend fun upsertParsedPayment(parsed: ParsedPayment, sourceType: SourceType, screenshotId: Long?): CaptureResult {
-        val dedupe = parser.dedupeKey(parsed)
-        dao.findByDedupeKey(dedupe)?.let { existing ->
-            val updated = if (screenshotId != null && existing.screenshotId == null) {
-                existing.copy(screenshotId = screenshotId, updatedAt = System.currentTimeMillis())
-            } else existing
-            if (updated != existing) dao.updateTransaction(updated)
-            return CaptureResult(updated, false)
-        }
-        val from = parsed.paidAt - DEDUP_WINDOW_MS
-        val to = parsed.paidAt + DEDUP_WINDOW_MS
-        val similar = dao.findSimilar(parsed.paymentApp, parsed.amountCents, parsed.type, from, to)
-            ?: if (sourceType in automaticSources) dao.findSimilarAutoAnyApp(parsed.amountCents, parsed.type, from, to, automaticSources) else null
-        if (similar != null) {
-            if (screenshotId != null && similar.screenshotId == null) {
-                val updated = similar.copy(screenshotId = screenshotId, updatedAt = System.currentTimeMillis())
-                dao.updateTransaction(updated)
-                return CaptureResult(updated, false)
+            val safeAmount = sanitizeAmountCents(parsed.amountCents)
+            if (safeAmount <= 0L) {
+                addLog("记账拦截", "金额异常跳过", "amountCents=${parsed.amountCents} ${parsed.merchantName}")
+                return CaptureResult(null, false)
             }
-            return CaptureResult(similar, false)
+            val safeParsed = if (safeAmount == parsed.amountCents) parsed else parsed.copy(amountCents = safeAmount)
+            val dedupe = parser.dedupeKey(safeParsed)
+            dao.findByDedupeKey(dedupe)?.let { existing ->
+                val merged = mergeIntoExistingTransaction(existing, safeParsed, screenshotId, sourceType)
+                return CaptureResult(merged, false)
+            }
+            // 截图与通知合并窗口放宽到 30 分钟；同金额同类型优先合并
+            val windowMs = if (sourceType == SourceType.SCREENSHOT || sourceType == SourceType.NOTIFICATION) {
+                30 * 60 * 1000L
+            } else {
+                DEDUP_WINDOW_MS
+            }
+            val from = safeParsed.paidAt - windowMs
+            val to = safeParsed.paidAt + windowMs
+            val similar = dao.findSimilar(safeParsed.paymentApp, safeParsed.amountCents, safeParsed.type, from, to)
+                ?: if (sourceType in automaticSources) {
+                    dao.findSimilarAutoAnyApp(safeParsed.amountCents, safeParsed.type, from, to, automaticSources)
+                } else null
+            if (similar != null) {
+                val merged = mergeIntoExistingTransaction(similar, safeParsed, screenshotId, sourceType)
+                return CaptureResult(merged, false)
+            }
+
+            val rules = dao.getMerchantRules()
+            val category = chooseCategory(safeParsed, rules)
+            val now = System.currentTimeMillis()
+            val id = dao.insertTransaction(
+                            TransactionEntity(
+                                amountCents = safeParsed.amountCents,
+                                merchantName = safeParsed.merchantName,
+                                categoryId = category,
+                                paymentApp = safeParsed.paymentApp,
+                                paidAt = safeParsed.paidAt,
+                                sourceType = sourceType,
+                                screenshotId = screenshotId,
+                                dedupeKey = dedupe,
+                                confidence = safeParsed.confidence,
+                                note = safeParsed.note.takeIf { it.isNotBlank() }.orEmpty(),
+                                createdAt = now,
+                                updatedAt = now,
+                                type = safeParsed.type
+                            )
+                        )
+                        val transaction = dao.getTransaction(id)
+                        return CaptureResult(transaction, transaction != null)
+                    }
+
+    /**
+     * 合并记账：通知先记一笔（可能信息不全），截图后到则补全字段并挂凭证，不新建第二笔。
+     */
+    private suspend fun mergeIntoExistingTransaction(
+        existing: TransactionEntity,
+        parsed: ParsedPayment,
+        screenshotId: Long?,
+        sourceType: SourceType
+    ): TransactionEntity {
+        var updated = existing
+        var changed = false
+
+        // 1) 挂截图凭证
+        if (screenshotId != null) {
+            if (existing.screenshotId == null || existing.screenshotId != screenshotId) {
+                updated = updated.copy(screenshotId = screenshotId)
+                changed = true
+            }
+            dao.getScreenshot(screenshotId)?.let { ss ->
+                if (ss.parsedTransactionId != existing.id || ss.status != ScreenshotStatus.CONFIRMED) {
+                    dao.updateScreenshot(
+                        ss.copy(
+                            parsedTransactionId = existing.id,
+                            status = ScreenshotStatus.CONFIRMED
+                        )
+                    )
+                }
+            }
         }
 
-        val rules = dao.getMerchantRules()
-        val category = chooseCategory(parsed, rules)
-        val now = System.currentTimeMillis()
-        val id = dao.insertTransaction(
-            TransactionEntity(
-                amountCents = parsed.amountCents,
-                merchantName = parsed.merchantName,
-                categoryId = category,
-                paymentApp = parsed.paymentApp,
-                paidAt = parsed.paidAt,
-                sourceType = sourceType,
-                screenshotId = screenshotId,
-                dedupeKey = dedupe,
-                confidence = parsed.confidence,
-                note = parsed.categoryHint.takeIf { it.isNotBlank() }.orEmpty(),
-                createdAt = now,
-                updatedAt = now,
-                type = parsed.type
+        // 2) 商户名：现有是默认/平台名，或新商户更具体时补全
+        val newMerchant = parsed.merchantName.trim()
+        if (newMerchant.isNotBlank() && newMerchant != "AI识别消费" && isGenericMerchant(existing.merchantName)) {
+            if (newMerchant != existing.merchantName) {
+                updated = updated.copy(merchantName = newMerchant)
+                changed = true
+            }
+        } else if (
+            newMerchant.isNotBlank() &&
+            newMerchant != "AI识别消费" &&
+            newMerchant.length > existing.merchantName.length &&
+            !isGenericMerchant(newMerchant) &&
+            (existing.merchantName.contains(newMerchant) || newMerchant.contains(existing.merchantName.take(4)))
+        ) {
+            updated = updated.copy(merchantName = newMerchant)
+            changed = true
+        }
+
+        // 3) 备注：截图通常有商品名，优先补到 note
+        val newNote = parsed.note.trim()
+        if (newNote.isNotBlank()) {
+            val cats = setOf("购物", "餐饮", "交通", "生活缴费", "娱乐", "医疗", "教育", "转账", "人情", "退款", "工资", "奖金", "理财", "其他", "宠物")
+            if (existing.note.isBlank() || existing.note in cats || existing.note == existing.categoryId) {
+                if (newNote !in cats && newNote != existing.note) {
+                    updated = updated.copy(note = newNote)
+                    changed = true
+                }
+            }
+        }
+
+        // 4) 分类：现有是「其他」时，用新解析分类替换
+        if (existing.categoryId == BuiltInCategories.OTHER || existing.categoryId.isBlank()) {
+            val rules = dao.getMerchantRules()
+            val better = chooseCategory(parsed, rules)
+            if (better != BuiltInCategories.OTHER && better != existing.categoryId) {
+                updated = updated.copy(categoryId = better)
+                changed = true
+            }
+        }
+
+        // 5) 支付 App：UNKNOWN 时用新值
+        if (existing.paymentApp == PaymentApp.UNKNOWN && parsed.paymentApp != PaymentApp.UNKNOWN) {
+            updated = updated.copy(paymentApp = parsed.paymentApp)
+            changed = true
+        }
+
+        // 6) 时间：截图解析到更可信的支付时间时更新
+        if (sourceType == SourceType.SCREENSHOT && parsed.paidAt > 0) {
+            val delta = kotlin.math.abs(parsed.paidAt - existing.paidAt)
+            if (delta > 2 * 60 * 1000L) {
+                updated = updated.copy(paidAt = parsed.paidAt)
+                changed = true
+            }
+        }
+
+        // 7) 置信度取更高
+        if (parsed.confidence > existing.confidence) {
+            updated = updated.copy(confidence = parsed.confidence)
+            changed = true
+        }
+
+        if (changed) {
+            updated = updated.copy(updatedAt = System.currentTimeMillis())
+            dao.updateTransaction(updated)
+            addLog(
+                if (sourceType == SourceType.SCREENSHOT) "截图合并" else "合并记账",
+                "补充已有账单",
+                "#${existing.id} ${updated.merchantName} ¥${updated.amountCents / 100.0}"
             )
-        )
-        val transaction = dao.getTransaction(id)
-        return CaptureResult(transaction, transaction != null)
+        } else if (screenshotId != null) {
+            addLog("截图合并", "同笔账单已存在，已关联凭证", "#${existing.id}")
+        }
+        return updated
+    }
+
+    private fun isGenericMerchant(name: String): Boolean {
+        val n = name.trim()
+        if (n.isBlank()) return true
+        return n == "未知" || n == "导入消费" || n == "未识别商户" || n == "导入收入" ||
+            n == "AI识别消费" || n == "未命名消费" || n == "AI添加" ||
+            n.startsWith("微信支付") || n.startsWith("支付宝") || n.startsWith("京东支付") ||
+            n == "拼多多" || n == "淘宝" || n == "天猫" || n == "抖音" || n == "美团"
     }
 
     private suspend fun supplementTransaction(existing: TransactionEntity, newMerchant: String, pageText: String): TransactionEntity? {
         var updated = existing
         var changed = false
 
-        // 补充商户名：如果现有记录商户名是"未知"或"导入消费"等默认值
-        if (newMerchant.isNotBlank() && newMerchant.length >= 2 &&
-            (existing.merchantName == "未知" || existing.merchantName == "导入消费" ||
-             existing.merchantName == "未识别商户" || existing.merchantName == "导入收入" ||
-             existing.merchantName.startsWith("微信支付") || existing.merchantName.startsWith("支付宝") ||
-             existing.merchantName.startsWith("京东支付"))) {
+        if (newMerchant.isNotBlank() && newMerchant.length >= 2 && isGenericMerchant(existing.merchantName)) {
             updated = updated.copy(merchantName = newMerchant)
             changed = true
         }
 
-        // 补充分类：如果现有分类是"其他"且页面信息能推断出更好的分类
         if (existing.categoryId == BuiltInCategories.OTHER && pageText.isNotBlank()) {
             val rules = dao.getMerchantRules()
             val betterCategory = classifier.classify(newMerchant, pageText, rules, existing.paymentApp)
@@ -824,23 +1115,60 @@ class AutoBookRepository(
         return aiRecognizer.recognize(bitmap, config, ocrText)
     }
 
-    private suspend fun recognizeNotificationWithAi(rawText: String, fallback: ParsedPayment): Result<AiParsedPayment?> {
+    private suspend fun recognizeWithAiRaw(bitmap: Bitmap): Result<AiParsedPayment>? {
         val config = aiSettingsStore.loadConfig()
-        if (!config.configured) return Result.success(null)
-        repeat(3) { attempt ->
-            try {
-                return aiRecognizer.recognizePaymentText(rawText, config).map { ai -> ai }
-            } catch (e: Exception) {
-                aiRecognizer.recordFailure()
-                if (attempt < 2) {
-                    addLog("通知监听", "AI调用失败，${2 - attempt}秒后重试(${attempt + 1}/3)", e.message?.take(50) ?: "")
-                    kotlinx.coroutines.delay(2000L)
-                } else {
-                    addLog("通知监听", "AI调用失败，3次重试均失败", e.message?.take(50) ?: "")
+        if (!config.configured) return null
+        return aiRecognizer.recognizeRaw(bitmap, config)
+    }
+
+    suspend fun recognizeAccessibilityScreenshot(bitmap: Bitmap, config: AiRecognitionConfig): AiParsedPayment? {
+        return try {
+            aiRecognizer.recognize(bitmap, config, "").getOrNull()
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    private suspend fun recognizeNotificationWithAi(rawText: String): Result<AiParsedPayment?> {
+        val config = aiSettingsStore.loadConfig()
+        android.util.Log.d(TAG, "recognizeNotificationWithAi: configured=${config.configured}, url=${config.apiUrl.take(40)}, model=${config.model}, text=${rawText.take(50)}")
+        if (!config.configured) {
+            android.util.Log.w(TAG, "AI未配置，跳过")
+            return Result.success(null)
+        }
+        return aiMutex.withLock {
+            // 每次 AI 调用间隔至少 1.5 秒，防止限流
+            val elapsed = System.currentTimeMillis() - lastAiCallTime
+            if (elapsed < 1500) {
+                kotlinx.coroutines.delay(1500 - elapsed)
+            }
+            var lastError = ""
+            repeat(3) { attempt ->
+                try {
+                    lastAiCallTime = System.currentTimeMillis()
+                    android.util.Log.d(TAG, "AI调用中... (attempt ${attempt + 1}/3)")
+                    val result = aiRecognizer.recognizePaymentText(rawText, config)
+                    val ai = result.getOrNull()
+                    if (ai != null) {
+                        android.util.Log.d(TAG, "AI返回: amount=${ai.amountCents}, merchant=${ai.merchantName}, isSpam=${ai.isSpam}, type=${ai.type}")
+                    } else {
+                        android.util.Log.w(TAG, "AI返回null, exception=${result.exceptionOrNull()?.message}")
+                    }
+                    return@withLock result.map { it }
+                } catch (e: Exception) {
+                    aiRecognizer.recordFailure()
+                    lastError = e.message?.take(100) ?: "未知错误"
+                    android.util.Log.e(TAG, "AI调用失败(attempt ${attempt + 1}/3): ${e.message?.take(100)}")
+                    if (attempt < 2) {
+                        addLog("通知监听", "AI调用失败(${attempt+1}/3)，2秒后重试", lastError)
+                        kotlinx.coroutines.delay(2000L)
+                    } else {
+                        addLog("通知监听", "AI调用失败，3次重试均失败", lastError)
+                    }
                 }
             }
+            Result.failure(Exception("AI调用失败: $lastError"))
         }
-        return Result.failure(Exception("AI调用失败"))
     }
 
     private fun AiParsedPayment.toLocalParsed(fallback: ParsedPayment, rawText: String): ParsedPayment? {
@@ -854,28 +1182,88 @@ class AutoBookRepository(
         )
     }
 
-    private fun AiParsedPayment.canAutoImport(): Boolean {
-        if (amountCents == null || amountCents <= 0L) return false
-        if (confidence < AI_AUTO_IMPORT_CONFIDENCE) return false
-        val evidence = listOf(merchantName, note, categoryHint, reason).joinToString(" ")
-        return evidence.isNotBlank() || paymentApp != PaymentApp.UNKNOWN
+
+    private fun looksLikeChatOrNonPaymentScreenshot(ocrText: String, ai: AiParsedPayment?): Boolean {
+        if (ai?.isSpam == true) return true
+        val text = buildString {
+            append(ocrText)
+            append(' ')
+            if (ai != null) {
+                append(ai.reason)
+                append(' ')
+                append(ai.note)
+                append(' ')
+                append(ai.merchantName)
+                append(' ')
+                append(ai.rawJson)
+            }
+        }
+        val chatHints = listOf(
+                    "我已经付款", "已付款了", "转文字", "按住 说话", "按住说话",
+                    "表情", "语音", "视频通话", "聊天", "会话", "消息", "发送", "按住"
+                )
+                val paymentHints = listOf(
+                    "支付成功", "付款成功", "交易成功", "订单详情", "账单详情", "实付", "实付款",
+                    "退款到账", "收款方", "商户单号", "交易单号", "支付方式", "当前状态",
+                    "商家转账", "转账时间", "付款商家", "收款方式", "付款单号", "下单时间", "支付时间"
+                )
+        val hasChat = chatHints.any { text.contains(it) }
+        val hasPayment = paymentHints.any { text.contains(it) }
+        // 聊天特征明显且没有支付页特征 -> 非支付截图
+        return hasChat && !hasPayment
     }
 
-    private fun AiParsedPayment.toParsedPayment(): ParsedPayment? {
-        val amount = amountCents ?: return null
-        val merchant = merchantName.ifBlank { note.ifBlank { "AI识别消费" } }
-        return ParsedPayment(
-            amountCents = amount,
-            merchantName = merchant,
-            paymentApp = paymentApp,
-            paidAt = paidAt ?: System.currentTimeMillis(),
-            confidence = confidence,
-            rawText = listOf(rawJson, categoryHint, note, reason).joinToString("\n"),
-            type = type,
-            categoryHint = categoryHint,
-            isSpam = isSpam
-        )
-    }
+    private fun AiParsedPayment.canAutoImport(): Boolean {
+            if (isSpam) return false
+            if (amountCents == null || amountCents <= 0L) return false
+            if (confidence < AI_AUTO_IMPORT_CONFIDENCE) return false
+            val evidence = listOf(merchantName, note, categoryHint, reason, rawJson, type.name).joinToString(" ")
+            // 明确账单/支付特征（含微信商家转账收款页）
+            val paymentHints = listOf(
+                "支付成功", "付款成功", "交易成功", "订单详情", "账单详情", "实付", "实付款", "退款到账",
+                "商家转账", "转账时间", "付款商家", "收款方式", "付款单号", "到账", "零钱", "财付通",
+                "下单时间", "支付时间", "交易单号", "商户单号", "当前状态"
+            )
+            val hasPaymentEvidence = paymentHints.any { evidence.contains(it) }
+
+            // 聊天/会话类截图禁止自动入账（不要用单独的“微信”二字，否则微信支付/微信账单都会被误拦）
+            val chatHints = listOf(
+                "聊天", "会话", "消息", "我已经付款", "已付款了",
+                "语音", "视频通话", "转文字", "按住说话", "按住 说话", "表情"
+            )
+            if (chatHints.any { evidence.contains(it) } && !hasPaymentEvidence) {
+                return false
+            }
+            // 必须有商户或备注之一；收入到账可放宽到付款商家/平台名
+            val merchant = merchantName.trim()
+            if ((merchant.isBlank() || merchant == "AI识别消费") && note.isBlank() && !hasPaymentEvidence) {
+                return false
+            }
+            return true
+        }
+
+    private fun AiParsedPayment.toParsedPayment(
+            fallbackApp: PaymentApp = PaymentApp.UNKNOWN,
+            fallbackPaidAt: Long = System.currentTimeMillis()
+        ): ParsedPayment? {
+            val amount = amountCents ?: return null
+            if (isSpam) return null
+            val merchant = merchantName.ifBlank { note.ifBlank { "AI识别消费" } }
+            val app = if (paymentApp == PaymentApp.UNKNOWN && fallbackApp != PaymentApp.UNKNOWN) fallbackApp else paymentApp
+            val safePaidAt = paidAt?.takeIf { it > 0 } ?: fallbackPaidAt.takeIf { it > 0 } ?: System.currentTimeMillis()
+            return ParsedPayment(
+                amountCents = amount,
+                merchantName = merchant,
+                paymentApp = app,
+                paidAt = safePaidAt,
+                confidence = confidence,
+                rawText = listOf(rawJson, categoryHint, note, reason).joinToString("\n"),
+                type = type,
+                categoryHint = categoryHint,
+                note = note,
+                isSpam = isSpam
+            )
+        }
 
     private fun chooseCategory(parsed: ParsedPayment, rules: List<MerchantRuleEntity>): String {
         categoryFromHint(parsed.categoryHint, parsed.type)?.let { return it }
@@ -1035,8 +1423,15 @@ class AutoBookRepository(
         return false
     }
 
-    suspend fun addLog(source: String, action: String, detail: String) = withContext(Dispatchers.IO) {
-        dao.insertLog(AutoBookLogEntry(createdAt = System.currentTimeMillis(), source = source, action = action, detail = detail))
+    suspend fun addLog(source: String, action: String, detail: String): Long? = withContext(Dispatchers.IO) {
+        android.util.Log.d(TAG, "addLog: source=$source, action=$action, detail=${detail.take(50)}")
+        runCatching {
+            val id = dao.insertLog(AutoBookLogEntry(createdAt = System.currentTimeMillis(), source = source, action = action, detail = detail))
+            android.util.Log.d(TAG, "addLog成功: id=$id")
+            id
+        }.onFailure { error ->
+            android.util.Log.e(TAG, "写入操作日志失败: ${error.message}", error)
+        }.getOrNull()
     }
 
     suspend fun clearLogs() = withContext(Dispatchers.IO) { dao.clearLogs() }
@@ -1106,20 +1501,36 @@ class AutoBookRepository(
     }
 
     // ====== AI 对话 ======
-    // ====== 统计聚合 ======
-    suspend fun getMonthExpense(start: Long): Long = withContext(Dispatchers.IO) { dao.getMonthExpense(start) }
-    suspend fun getMonthIncome(start: Long): Long = withContext(Dispatchers.IO) { dao.getMonthIncome(start) }
-    suspend fun getTodayExpense(start: Long): Long = withContext(Dispatchers.IO) { dao.getTodayExpense(start) }
-    suspend fun getTodayIncome(start: Long): Long = withContext(Dispatchers.IO) { dao.getTodayIncome(start) }
+        // ====== 统计聚合 ======
+        suspend fun getMonthExpense(start: Long): Long = withContext(Dispatchers.IO) {
+            runCatching { dao.getMonthExpense(start) }.getOrDefault(0L)
+        }
+        suspend fun getMonthIncome(start: Long): Long = withContext(Dispatchers.IO) {
+            runCatching { dao.getMonthIncome(start) }.getOrDefault(0L)
+        }
+        suspend fun getTodayExpense(start: Long): Long = withContext(Dispatchers.IO) {
+            runCatching { dao.getTodayExpense(start) }.getOrDefault(0L)
+        }
+        suspend fun getTodayIncome(start: Long): Long = withContext(Dispatchers.IO) {
+            runCatching { dao.getTodayIncome(start) }.getOrDefault(0L)
+        }
 
-    fun observeChatMessages(): Flow<List<ChatMessage>> = chatDao.observeMessages()
+        private fun sanitizeAmountCents(amountCents: Long): Long {
+            return when {
+                amountCents < 0L -> 0L
+                amountCents > MAX_AMOUNT_CENTS -> 0L
+                else -> amountCents
+            }
+        }
 
-    suspend fun sendChatMessage(userMessage: String): String = withContext(Dispatchers.IO) {
+        fun observeChatMessages(): Flow<List<ChatMessage>> = chatDao.observeMessages()
+
+    suspend fun sendChatMessage(userMessage: String, imageUri: String? = null, fileName: String? = null): String = withContext(Dispatchers.IO) {
         // 保存用户消息
-        chatDao.insert(ChatMessage(role = "user", content = userMessage))
+        chatDao.insert(ChatMessage(role = "user", content = userMessage, imageUri = imageUri, fileName = fileName))
 
         // 构建账单上下文
-        val recentTxs = dao.getTransactions().take(100)
+        val recentTxs = dao.getRecentTransactions(CHAT_CONTEXT_LIMIT)
         val categories = dao.getCategories()
         val txSummary = recentTxs.joinToString("\n") { tx ->
             val cat = categories.firstOrNull { it.id == tx.categoryId }?.name ?: "其他"
@@ -1173,11 +1584,30 @@ $chatHistory
         }
 
         try {
+            // 构建用户消息内容（支持多模态）
+            val userContent = if (imageUri != null) {
+                // 读取并压缩图片，转base64
+                val base64 = imageUriToBase64(imageUri)
+                if (base64 != null) {
+                    val contentArray = org.json.JSONArray()
+                    contentArray.put(org.json.JSONObject().put("type", "text").put("text", prompt))
+                    contentArray.put(org.json.JSONObject()
+                        .put("type", "image_url")
+                        .put("image_url", org.json.JSONObject()
+                            .put("url", "data:image/jpeg;base64,$base64")))
+                    contentArray
+                } else {
+                    prompt // 图片读取失败，降级为纯文本
+                }
+            } else {
+                prompt
+            }
+
             val body = org.json.JSONObject()
                 .put("model", config.model)
                 .put("messages", org.json.JSONArray()
                     .put(org.json.JSONObject().put("role", "system").put("content", "你是智能记账助手，简洁回答，中文"))
-                    .put(org.json.JSONObject().put("role", "user").put("content", prompt)))
+                    .put(org.json.JSONObject().put("role", "user").put("content", userContent)))
                 .put("temperature", 0.3)
                 .put("max_tokens", 800)
 
@@ -1215,8 +1645,50 @@ $chatHistory
             val action = json.optString("action")
             val target = json.optString("target")
             val value = json.optString("value")
-            val allTxs = dao.getTransactions()
             val categories = dao.getCategories()
+            val zone = java.time.ZoneId.systemDefault()
+            val nowMs = System.currentTimeMillis()
+
+            fun resolveCategoryId(raw: String, type: TransactionType = TransactionType.EXPENSE): String? {
+                if (raw.isBlank()) return null
+                return categories.firstOrNull { it.name.contains(raw) }?.id
+                    ?: categories.firstOrNull { it.id == raw }?.id
+            }
+
+            suspend fun queryByTarget(t: String): List<TransactionEntity> {
+                            return when {
+                                t.isBlank() || t == "all" -> dao.getTransactions()
+                                t.startsWith("id:") -> {
+                                    val id = t.removePrefix("id:").toLongOrNull()
+                                    if (id != null) listOfNotNull(dao.getTransaction(id)) else emptyList()
+                                }
+                                t.startsWith("date:") -> {
+                                    val date = java.time.LocalDate.parse(t.removePrefix("date:"))
+                                    val startMs = date.atStartOfDay(zone).toInstant().toEpochMilli()
+                                    val endMs = date.plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli()
+                                    dao.getTransactionsBetween(startMs, endMs)
+                                }
+                                t.startsWith("month:") -> {
+                                    val ym = java.time.YearMonth.parse(t.removePrefix("month:"))
+                                    val startMs = ym.atDay(1).atStartOfDay(zone).toInstant().toEpochMilli()
+                                    val endMs = ym.plusMonths(1).atDay(1).atStartOfDay(zone).toInstant().toEpochMilli()
+                                    dao.getTransactionsBetween(startMs, endMs)
+                                }
+                                t.startsWith("category:") -> {
+                                    val catId = resolveCategoryId(t.removePrefix("category:"))
+                                    if (catId != null) dao.getTransactionsByCategory(catId) else emptyList()
+                                }
+                                t.startsWith("type:") -> {
+                                    val txType = when (t.removePrefix("type:").uppercase()) {
+                                        "EXPENSE" -> TransactionType.EXPENSE
+                                        "INCOME" -> TransactionType.INCOME
+                                        else -> TransactionType.OTHER
+                                    }
+                                    dao.getTransactionsByType(txType)
+                                }
+                                else -> dao.getTransactionsByMerchant(t)
+                            }
+                        }
 
             when (action) {
                 // ====== 添加账单 ======
@@ -1234,108 +1706,80 @@ $chatHistory
                         else -> TransactionType.EXPENSE
                     }
                     val catId = if (cat.isNotBlank()) {
-                        categories.firstOrNull { it.name.contains(cat) }?.id ?: BuiltInCategories.fallbackFor(txType)
+                        resolveCategoryId(cat, txType) ?: BuiltInCategories.fallbackFor(txType)
                     } else BuiltInCategories.fallbackFor(txType)
-                    val paidAt = if (paidAtStr.isNotBlank()) {
-                        parseAiDateTime(paidAtStr)
-                    } else System.currentTimeMillis()
-                    val id = addManualTransaction(merchant, (amount * 100).toLong(), catId, paidAt = paidAt, type = txType, note = note)
-                    val timeStr = java.time.Instant.ofEpochMilli(paidAt).atZone(java.time.ZoneId.systemDefault()).toLocalTime().withSecond(0).withNano(0).toString()
+                    val paidAt = if (paidAtStr.isNotBlank()) parseAiDateTime(paidAtStr) else System.currentTimeMillis()
+                    addManualTransaction(merchant, (amount * 100).toLong(), catId, paidAt = paidAt, type = txType, note = note)
+                    val timeStr = java.time.Instant.ofEpochMilli(paidAt).atZone(zone).toLocalTime().withSecond(0).withNano(0).toString()
                     "已添加: $merchant ¥$amount [${txType.label}] $timeStr"
                 }
 
                 // ====== 删除账单 ======
                 "delete" -> {
-                    val txs = if (target.isBlank() || target == "all") allTxs
-                    else if (target.startsWith("id:")) {
-                        val id = target.removePrefix("id:").toLongOrNull()
-                        if (id != null) listOfNotNull(dao.getTransaction(id)) else emptyList()
-                    } else if (target.startsWith("date:")) {
-                        val dateStr = target.removePrefix("date:")
-                        val date = java.time.LocalDate.parse(dateStr)
-                        val start = date.atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
-                        val end = date.plusDays(1).atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
-                        allTxs.filter { it.paidAt in start until end }
-                    } else if (target.startsWith("category:")) {
-                        val catName = target.removePrefix("category:")
-                        val catId = categories.firstOrNull { it.name.contains(catName) }?.id
-                        if (catId != null) allTxs.filter { it.categoryId == catId } else emptyList()
+                    val txs = queryByTarget(target)
+                    if (txs.isEmpty()) {
+                        "没有找到匹配的记录"
                     } else {
-                        allTxs.filter { it.merchantName.contains(target, ignoreCase = true) }
+                        deleteTransactionsWithImages(txs.map { it.id })
+                        "已删除 ${txs.size} 条记录"
                     }
-                    txs.forEach { dao.deleteTransaction(it.id) }
-                    if (txs.isEmpty()) "没有找到匹配的记录" else "已删除 ${txs.size} 条记录"
                 }
 
                 // ====== 修改分类 ======
                 "update_category" -> {
-                    val txs = if (target == "all") allTxs
-                    else if (target.startsWith("id:")) {
-                        val id = target.removePrefix("id:").toLongOrNull()
-                        if (id != null) listOfNotNull(dao.getTransaction(id)) else emptyList()
-                    } else allTxs.filter { it.merchantName.contains(target, ignoreCase = true) }
-                    val catId = categories.firstOrNull { it.name.contains(value) }?.id
-                        ?: categories.firstOrNull { it.id == value }?.id
+                    val catId = resolveCategoryId(value)
                         ?: return@withContext "找不到分类: $value"
-                    txs.forEach { dao.updateTransaction(it.copy(categoryId = catId, updatedAt = System.currentTimeMillis())) }
-                    if (txs.isEmpty()) "没有找到匹配的记录" else "已将 ${txs.size} 条记录分类改为${categories.firstOrNull { it.id == catId }?.name ?: value}"
+                    val catName = categories.firstOrNull { it.id == catId }?.name ?: value
+                    val updated = when {
+                        target.isBlank() || target == "all" -> dao.updateAllCategories(catId, nowMs)
+                        target.startsWith("id:") -> {
+                            val id = target.removePrefix("id:").toLongOrNull()
+                            val tx = if (id != null) dao.getTransaction(id) else null
+                            if (tx != null) {
+                                dao.updateTransaction(tx.copy(categoryId = catId, updatedAt = nowMs))
+                                1
+                            } else 0
+                        }
+                        else -> dao.updateCategoryByMerchant(target, catId, nowMs)
+                    }
+                    if (updated <= 0) "没有找到匹配的记录" else "已将 $updated 条记录分类改为$catName"
                 }
 
                 // ====== 修改商户名 ======
                 "update_merchant" -> {
-                    val txs = if (target.startsWith("id:")) {
-                        val id = target.removePrefix("id:").toLongOrNull()
-                        if (id != null) listOfNotNull(dao.getTransaction(id)) else emptyList()
-                    } else allTxs.filter { it.merchantName.contains(target, ignoreCase = true) }
-                    txs.forEach { dao.updateTransaction(it.copy(merchantName = value, updatedAt = System.currentTimeMillis())) }
-                    if (txs.isEmpty()) "没有找到匹配的记录" else "已将 ${txs.size} 条记录商户名改为$value"
+                    val updated = when {
+                        target.startsWith("id:") -> {
+                            val id = target.removePrefix("id:").toLongOrNull()
+                            val tx = if (id != null) dao.getTransaction(id) else null
+                            if (tx != null) {
+                                dao.updateTransaction(tx.copy(merchantName = value, updatedAt = nowMs))
+                                1
+                            } else 0
+                        }
+                        target.isNotBlank() -> dao.updateMerchantNameByKeyword(target, value, nowMs)
+                        else -> 0
+                    }
+                    if (updated <= 0) "没有找到匹配的记录" else "已将 $updated 条记录商户名改为$value"
                 }
 
                 // ====== 修改金额 ======
                 "update_amount" -> {
                     val amount = value.toDoubleOrNull()
                     if (amount == null || amount <= 0) return@withContext "无效金额: $value"
-                    val txs = if (target.startsWith("id:")) {
-                        val id = target.removePrefix("id:").toLongOrNull()
-                        if (id != null) listOfNotNull(dao.getTransaction(id)) else emptyList()
-                    } else emptyList()
-                    txs.forEach { dao.updateTransaction(it.copy(amountCents = (amount * 100).toLong(), updatedAt = System.currentTimeMillis())) }
-                    if (txs.isEmpty()) "请指定具体账单ID" else "已修改 ${txs.size} 条记录金额为 ¥$amount"
+                    if (!target.startsWith("id:")) return@withContext "请指定具体账单ID"
+                    val id = target.removePrefix("id:").toLongOrNull()
+                    val tx = if (id != null) dao.getTransaction(id) else null
+                    if (tx == null) {
+                        "请指定具体账单ID"
+                    } else {
+                        dao.updateTransaction(tx.copy(amountCents = (amount * 100).toLong(), updatedAt = nowMs))
+                        "已修改 1 条记录金额为 ¥$amount"
+                    }
                 }
 
                 // ====== 查询 ======
                 "query" -> {
-                    val txs = when {
-                        target == "all" -> allTxs
-                        target.startsWith("category:") -> {
-                            val catName = target.removePrefix("category:")
-                            val catId = categories.firstOrNull { it.name.contains(catName) }?.id
-                            if (catId != null) allTxs.filter { it.categoryId == catId } else emptyList()
-                        }
-                        target.startsWith("date:") -> {
-                            val dateStr = target.removePrefix("date:")
-                            val date = java.time.LocalDate.parse(dateStr)
-                            val start = date.atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
-                            val end = date.plusDays(1).atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
-                            allTxs.filter { it.paidAt in start until end }
-                        }
-                        target.startsWith("month:") -> {
-                            val monthStr = target.removePrefix("month:")
-                            val ym = java.time.YearMonth.parse(monthStr)
-                            val start = ym.atDay(1).atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
-                            val end = ym.plusMonths(1).atDay(1).atStartOfDay(java.time.ZoneId.systemDefault()).toInstant().toEpochMilli()
-                            allTxs.filter { it.paidAt in start until end }
-                        }
-                        target.startsWith("type:") -> {
-                            val txType = when (target.removePrefix("type:").uppercase()) {
-                                "EXPENSE" -> TransactionType.EXPENSE
-                                "INCOME" -> TransactionType.INCOME
-                                else -> TransactionType.OTHER
-                            }
-                            allTxs.filter { it.type == txType }
-                        }
-                        else -> allTxs.filter { it.merchantName.contains(target, ignoreCase = true) }
-                    }
+                    val txs = queryByTarget(target)
                     val total = txs.sumOf { it.amountCents } / 100.0
                     val byCategory = txs.groupBy { it.categoryId }.mapValues { it.value.sumOf { tx -> tx.amountCents } / 100.0 }
                     val catSummary = byCategory.entries.sortedByDescending { it.value }.joinToString(", ") { (catId, amount) ->
@@ -1356,8 +1800,15 @@ $chatHistory
                 // ====== 清空所有数据 ======
                 "clear_all" -> {
                     if (value != "confirm") return@withContext "危险操作！请确认后再清空"
-                    allTxs.forEach { dao.deleteTransaction(it.id) }
-                    "已清空全部 ${allTxs.size} 条账单记录"
+                    val total = dao.getTransactionCount().toInt()
+                    val allIds = dao.getAllTransactionIds()
+                    if (allIds.isNotEmpty()) {
+                        val screenshots = dao.getScreenshotsByTransactionIds(allIds)
+                        screenshots.forEach { screenshotStorage.delete(it.encryptedFilePath) }
+                    }
+                    dao.clearAllScreenshots()
+                    dao.clearAllTransactions()
+                    "已清空全部 $total 条账单记录"
                 }
 
                 // ====== 导出 ======
@@ -1371,8 +1822,49 @@ $chatHistory
             "操作失败: ${e.message?.take(200)}"
         }
     }
+
     suspend fun addChatMessage(role: String, content: String) = withContext(Dispatchers.IO) {
         chatDao.insert(ChatMessage(role = role, content = content))
+    }
+
+    /**
+     * 将图片URI转为base64字符串（JPEG格式，最大1280px，质量80%）
+     */
+    private fun imageUriToBase64(uriStr: String): String? {
+        return try {
+            val uri = android.net.Uri.parse(uriStr)
+            val resolver = context.contentResolver
+            val inputStream = resolver.openInputStream(uri) ?: return null
+            val originalBitmap = android.graphics.BitmapFactory.decodeStream(inputStream)
+            inputStream.close()
+            if (originalBitmap == null) return null
+
+            // 压缩到最大1280px
+            val maxSize = 1280
+            val w = originalBitmap.width
+            val h = originalBitmap.height
+            val scale = if (w > maxSize || h > maxSize) {
+                maxSize.toFloat() / maxOf(w, h)
+            } else 1f
+            val bitmap = if (scale < 1f) {
+                val nw = (w * scale).toInt()
+                val nh = (h * scale).toInt()
+                val scaled = android.graphics.Bitmap.createScaledBitmap(originalBitmap, nw, nh, true)
+                if (scaled !== originalBitmap) originalBitmap.recycle()
+                scaled
+            } else originalBitmap
+
+            try {
+                val baos = java.io.ByteArrayOutputStream()
+                bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 80, baos)
+                android.util.Base64.encodeToString(baos.toByteArray(), android.util.Base64.NO_WRAP)
+            } finally {
+                bitmap.recycle()
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("AutoBook", "imageUriToBase64 failed", e)
+            null
+        }
     }
 
     // ====== 数据备份/恢复 ======
@@ -1414,6 +1906,7 @@ $chatHistory
                 put("sortOrder", cat.sortOrder)
                 put("type", cat.type.name)
                 put("isDefault", cat.isDefault)
+                if (cat.parentId != null) put("parentId", cat.parentId)
             })
         }
         backup.put("categories", catArray)
@@ -1448,6 +1941,8 @@ $chatHistory
         val title: String = "SKY自动记账",
         val description: String = "",
         val website: String = "",
+        val github: String = "",
+        val sectionTitle: String = "AI记账助手推荐",
         val recommendations: List<Recommendation> = emptyList()
     )
     data class Recommendation(val name: String = "", val url: String = "", val desc: String = "")
@@ -1472,9 +1967,12 @@ $chatHistory
                 title = json.optString("title", "SKY自动记账"),
                 description = json.optString("description", ""),
                 website = json.optString("website", ""),
+                github = json.optString("github", ""),
+                sectionTitle = json.optString("sectionTitle", "AI记账助手推荐"),
                 recommendations = recs
             )
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            android.util.Log.w("AutoBook", "fetchAboutInfo failed: ${e.message}")
             AboutInfo()
         }
     }
@@ -1484,13 +1982,19 @@ $chatHistory
     private val SYNC_PREFS = "autobook_sync"
 
     fun getSyncConfig(): Pair<String, String> {
-        val prefs = context.getSharedPreferences(SYNC_PREFS, android.content.Context.MODE_PRIVATE)
-        return (prefs.getString("username", "") ?: "") to (prefs.getString("password", "") ?: "")
+        // 迁移：如果旧 SharedPreferences 中有明文密码，迁移到加密存储后清除
+        val oldPrefs = context.getSharedPreferences(SYNC_PREFS, android.content.Context.MODE_PRIVATE)
+        val oldUser = oldPrefs.getString("username", "") ?: ""
+        val oldPass = oldPrefs.getString("password", "") ?: ""
+        if (oldPass.isNotEmpty()) {
+            securePrefs.saveSyncCredentials(oldUser, oldPass)
+            oldPrefs.edit().remove("username").remove("password").apply()
+        }
+        return securePrefs.getSyncCredentials()
     }
 
     fun saveSyncConfig(username: String, password: String) {
-        context.getSharedPreferences(SYNC_PREFS, android.content.Context.MODE_PRIVATE)
-            .edit().putString("username", username).putString("password", password).apply()
+        securePrefs.saveSyncCredentials(username, password)
     }
 
     suspend fun syncPush(): String = withContext(Dispatchers.IO) {
@@ -1506,22 +2010,28 @@ $chatHistory
         payload.put("device_name", "${android.os.Build.BRAND} ${android.os.Build.MODEL}")
         payload.put("payload", backup)
 
+        val urls = if (com.tao.autobook.BuildConfig.DEBUG) {
+            listOf(SYNC_URL, "http://192.168.1.89:8000/api/sync")
+        } else {
+            listOf(SYNC_URL)
+        }
         try {
-            val conn = java.net.URL(SYNC_URL).openConnection() as java.net.HttpURLConnection
-            conn.requestMethod = "POST"
-            conn.setRequestProperty("Content-Type", "application/json")
-            conn.connectTimeout = 30000
-            conn.readTimeout = 30000
-            conn.doOutput = true
-            conn.outputStream.write(payload.toString().toByteArray())
-            val code = conn.responseCode
-            val resp = if (code in 200..299) {
-                conn.inputStream.bufferedReader().readText()
-            } else {
-                conn.errorStream?.bufferedReader()?.readText() ?: "Error $code"
+            for (url in urls) {
+                try {
+                    val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+                    conn.requestMethod = "POST"
+                    conn.setRequestProperty("Content-Type", "application/json")
+                    conn.setRequestProperty("User-Agent", "AutoBook/${android.os.Build.VERSION.RELEASE}")
+                    conn.connectTimeout = 8000
+                    conn.readTimeout = 8000
+                    conn.doOutput = true
+                    conn.outputStream.write(payload.toString().toByteArray())
+                    val code = conn.responseCode
+                    conn.disconnect()
+                    if (code in 200..299) return@withContext "推送成功"
+                } catch (_: Exception) { }
             }
-            conn.disconnect()
-            if (code in 200..299) "推送成功" else "推送失败: HTTP $code"
+            "推送失败: 服务器不可达，请检查网络"
         } catch (e: Exception) {
             "推送失败: ${e.message?.take(50)}"
         }
@@ -1538,34 +2048,41 @@ $chatHistory
         payload.put("device_id", getDeviceId())
         payload.put("device_name", "${android.os.Build.BRAND} ${android.os.Build.MODEL}")
 
-        try {
-            val conn = java.net.URL(SYNC_URL).openConnection() as java.net.HttpURLConnection
-            conn.requestMethod = "POST"
-            conn.setRequestProperty("Content-Type", "application/json")
-            conn.connectTimeout = 30000
-            conn.readTimeout = 30000
-            conn.doOutput = true
-            conn.outputStream.write(payload.toString().toByteArray())
-            val code = conn.responseCode
-            val resp = if (code in 200..299) {
-                conn.inputStream.bufferedReader().readText()
-            } else {
-                conn.errorStream?.bufferedReader()?.readText() ?: "Error $code"
-            }
-            conn.disconnect()
-            if (code !in 200..299) return@withContext "拉取失败: HTTP $code"
-            val respJson = org.json.JSONObject(resp)
-            if (respJson.optInt("code") == 200) {
-                val data = respJson.optJSONObject("detail")
-                if (data != null) {
-                    val result = importBackup(data)
-                    return@withContext "拉取成功，$result"
-                }
-            }
-            "拉取失败: ${respJson.optString("detail", "未知错误")}"
-        } catch (e: Exception) {
-            "拉取失败: ${e.message?.take(50)}"
+        val urls = if (com.tao.autobook.BuildConfig.DEBUG) {
+            listOf(SYNC_URL, "http://192.168.1.89:8000/api/sync")
+        } else {
+            listOf(SYNC_URL)
         }
+        for (url in urls) {
+            try {
+                val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
+                conn.requestMethod = "POST"
+                conn.setRequestProperty("Content-Type", "application/json")
+                conn.setRequestProperty("User-Agent", "AutoBook/${android.os.Build.VERSION.RELEASE}")
+                conn.connectTimeout = 30000
+                conn.readTimeout = 30000
+                conn.doOutput = true
+                conn.outputStream.write(payload.toString().toByteArray())
+                val code = conn.responseCode
+                val resp = if (code in 200..299) {
+                    conn.inputStream.bufferedReader().readText()
+                } else {
+                    conn.errorStream?.bufferedReader()?.readText() ?: "Error $code"
+                }
+                conn.disconnect()
+                if (code !in 200..299) continue
+                val respJson = org.json.JSONObject(resp)
+                if (respJson.optInt("code") == 200) {
+                    val data = respJson.optJSONObject("detail")
+                    if (data != null) {
+                        val result = importBackup(data)
+                        return@withContext "拉取成功，$result"
+                    }
+                }
+                return@withContext "拉取失败: ${respJson.optString("detail", "未知错误")}"
+            } catch (_: Exception) { }
+        }
+        "拉取失败: 所有服务器均不可达"
     }
 
     suspend fun importBackup(json: org.json.JSONObject): String = withContext(Dispatchers.IO) {
@@ -1583,7 +2100,8 @@ $chatHistory
                     color = obj.optLong("color", 0xFF5C6470),
                     sortOrder = obj.optInt("sortOrder", 0),
                     type = try { TransactionType.valueOf(obj.optString("type", "EXPENSE")) } catch (_: Exception) { TransactionType.EXPENSE },
-                    isDefault = obj.optBoolean("isDefault", false)
+                    isDefault = obj.optBoolean("isDefault", false),
+                    parentId = if (obj.has("parentId") && !obj.isNull("parentId")) obj.optString("parentId") else null
                 )
                 dao.upsertCategory(cat)
             }
@@ -1656,88 +2174,121 @@ $chatHistory
 
     fun getDefaultPrompt(type: String): String {
         return when (type) {
-            "notification" -> """你是中文支付通知记账解析器。请从通知标题/正文中提取一笔账单，只返回JSON，不要Markdown。
-字段：amount(number, 元), merchantName(string), paidAt(string, yyyy-MM-dd HH:mm 或空字符串), paymentApp(string, ALIPAY/WECHAT/UNION_PAY/JD/DOUYIN/TAOBAO/TMALL/PINDUODUO/MEITUAN/UNKNOWN), type(string, EXPENSE/INCOME/OTHER), categoryHint(string), note(string), confidence(number 0-1), reason(string), isSpam(boolean)。
+            "notification" -> """你是中文支付通知记账解析器。从通知中提取一笔账单，只返回JSON。
+字段：amount(number元), merchantName(string), paidAt(string yyyy-MM-dd HH:mm), paymentApp(string), type(string EXPENSE/INCOME/OTHER), categoryHint(string), note(string), confidence(number 0-1), reason(string), isSpam(boolean)。
 规则：
-1. 只有真实消费扣款、退款到账、转账收付才算有效账单
-2. 花呗账单/信用卡账单/广告/营销/订阅提醒/签到等必须返回isSpam=true
-3. isSpam=true时amount填0
-4. categoryHint必须是：餐饮/交通/购物/生活缴费/娱乐/医疗/教育/转账/人情/退款/工资/奖金/理财/其他
-5. merchantName必须是真实商户名，不能是"AI识别消费""""
-            "accessibility" -> """你是中文支付页面记账解析器。以下是从支付成功页面通过无障碍服务提取的文本。
-请从中提取一笔最明确的消费或退款记录，只返回JSON，不要Markdown。
-字段：amount(number, 元), merchantName(string), paidAt(string, yyyy-MM-dd HH:mm 或空字符串), paymentApp(string), type(string, EXPENSE/INCOME), categoryHint(string), note(string), confidence(number 0-1), reason(string), isSpam(boolean)。
+1. isSpam=true：签到/邀请/活动/抽奖/优惠券/广告/营销/贷款/验证码/物流/App推送。此时amount=0, merchantName=""
+2. isSpam=false：支付成功/付款成功/扣款成功/白条消费/退款到账。此时amount和merchantName必须填写
+3. merchantName填真实商户名，如：美团外卖、肯德基、滴滴出行。不能填"AI识别消费"
+4. categoryHint填分类，只能是：餐饮/交通/购物/生活缴费/娱乐/医疗/教育/转账/人情/退款/工资/奖金/理财/其他
+5. note填商品名，如：咖啡、外卖、洗衣液。禁止填购物、餐饮等分类名，无法确定时留空"""
+            "accessibility" -> """你是中文支付页面记账解析器。从支付成功页面文本中提取一笔消费记录，只返回JSON。
+字段：amount(number元), merchantName(string), paidAt(string yyyy-MM-dd HH:mm), paymentApp(string), type(string EXPENSE/INCOME), categoryHint(string), note(string), confidence(number 0-1), reason(string), isSpam(boolean)。
 规则：
-1. 金额提取：优先匹配¥/￥后面的数字
-2. 商户提取：从"付款给""商家""商品说明""支付对象"等字段提取，不能返回"AI识别消费"
-3. 忽略导航栏、广告、按钮文字
-4. 支付成功页面+金额→confidence不低于0.65
-5. categoryHint必须是：餐饮/交通/购物/生活缴费/娱乐/医疗/教育/转账/人情/退款/工资/奖金/理财/其他"""
-            else -> ""
+1. 金额：优先匹配¥/￥后面的数字，如¥12.50。取页面最明显的金额
+2. 商户名：从"付款给""商家""商品说明""收款方"等字段提取。不能填"AI识别消费"，无法确定时用支付App名
+3. categoryHint填分类，只能是：餐饮/交通/购物/生活缴费/娱乐/医疗/教育/转账/人情/退款/工资/奖金/理财/其他
+4. note填商品名，如：咖啡、洗衣液、手机壳。禁止填购物、餐饮等分类名，无法确定时留空
+5. 支付成功页面+有金额→confidence≥0.65。非消费页面→confidence<0.5
+6. 退款相关→type=INCOME, categoryHint=退款
+7. isSpam=true：非支付页面、还款页面、账单提醒、广告页面"""
+            "screenshot" -> """你是中文消费截图记账解析器。只从真实支付/账单/订单详情截图提取一笔账单，只返回JSON。
+                        JSON字段：amount(number元), merchantName(string), paidAt(string yyyy-MM-dd HH:mm 或空字符串), paymentApp(string ALIPAY/WECHAT/UNION_PAY/JD/DOUYIN/TAOBAO/TMALL/PINDUODUO/MEITUAN/UNKNOWN), type(string EXPENSE/INCOME/OTHER), categoryHint(string), note(string), confidence(number 0-1), reason(string), isSpam(boolean)。
+                        规则：
+                        1. isSpam=true：聊天记录、微信/QQ对话气泡页、仅“我已经付款了/已付款/好的收到”、无支付成功/订单/账单页特征
+                        2. isSpam=false：支付成功/付款成功/交易成功/订单详情/账单详情/商家转账收款/退款到账，且有明确金额
+                        3. categoryHint填分类：餐饮/交通/购物/生活缴费/娱乐/医疗/教育/转账/人情/退款/工资/奖金/理财/其他
+                        4. note填商品名，禁止填购物/餐饮等分类名；聊天截图 note 留空
+                        5. paidAt 时间优先级：①下单时间/创建时间 ②支付时间/付款时间/转账时间 ③完成时间/成交时间。多个时间并存时必须用下单时间，禁止用完成时间顶替；看不到就空字符串，禁止编造年份
+                        6. 金额带“+”/收款/到账 → type=INCOME；支出 type=EXPENSE
+                        7. 聊天/非支付页：isSpam=true, amount=0, confidence≤0.2；真实账单页 confidence≥0.7"""
+                        else -> ""
         }
     }
 
     // ====== 白名单关键词管理 ======
     private val WHITELIST_KEY = "whitelist_keywords"
     private val WHITELIST_INITIALIZED = "whitelist_initialized"
+    private val KEY_NOTIFICATION_AUTO_BOOK = "notification_auto_book_enabled"
+    private val KEY_HIDE_FROM_RECENTS = "hide_from_recents"
+    private val KEY_AUTO_DELETE_SCREENSHOT = "auto_delete_screenshot"
 
     private val DEFAULT_WHITELIST = listOf(
-        "支付", "消费", "支出", "扣款", "扣费", "交易", "账单", "付款", "收款",
-        "转账", "充值", "缴费", "购买", "下单", "预订", "订单", "支取", "扣收",
-        "代扣", "代缴", "刷卡", "闪付", "扫码付", "预授权", "快捷支付", "网上支付",
-        "线上支付", "线下支付", "POS消费", "跨行消费", "境外消费", "免密支付",
-        "扣划", "批量扣款", "委托扣款", "支付成功", "交易成功", "扣款成功",
-        "扣费成功", "已支付", "已付款", "已扣款", "已扣费", "完成支付",
-        "支付完成", "交易完成", "结算",
-        "外卖", "堂食", "午餐", "晚餐", "奶茶", "咖啡", "买菜", "生鲜", "水果",
-        "零食", "面包", "蛋糕", "火锅", "烧烤", "日料", "西餐", "快餐", "食堂",
-        "团餐", "熟食", "夜宵", "下午茶", "甜品", "冰淇淋", "餐厅", "饭店",
-        "酒楼", "大排档", "小吃", "订餐", "点餐", "烘焙", "茶饮", "自助餐",
-        "超市", "便利店", "商场", "网购", "淘宝", "京东", "拼多多", "唯品会",
-        "天猫", "商店", "商城", "专卖店", "百货", "零售", "卖场", "仓储店",
-        "会员店", "生鲜超市", "小卖部", "日用品", "抖音商城", "快手小店",
-        "小红书商城", "闲鱼", "转转", "得物", "苏宁易购",
-        "打车", "滴滴", "出租车", "地铁", "公交", "火车票", "高铁票", "机票",
-        "加油", "停车费", "过路费", "ETC", "共享单车", "租车", "网约车", "顺风车",
-        "代驾", "高速费", "洗车", "12306", "高德打车",
-        "房租", "房贷", "物业费", "水费", "电费", "燃气费", "暖气费", "网费",
-        "宽带", "话费", "流量",
-        "酒店", "宾馆", "民宿", "门票", "景区", "旅游", "携程", "去哪儿", "飞猪",
-        "电影票", "演唱会", "游戏充值", "会员", "视频VIP", "音乐VIP", "KTV",
-        "网吧", "直播打赏", "礼物", "展览",
-        "挂号", "医药", "药品", "医保", "体检", "牙科", "眼科", "疫苗",
-        "门诊", "买药", "药店", "医院", "诊所",
-        "学费", "培训费", "辅导班", "网课", "教材", "考试报名",
-        "衣服", "鞋子", "包包", "配饰", "护肤品", "化妆品", "理发",
-        "快递", "运费", "快递费", "跑腿", "代购",
-        "鲜花", "礼品", "彩票",
-        "奶粉", "纸尿裤", "童装", "早教",
-        "猫粮", "狗粮", "宠物医院", "宠物美容", "宠物用品",
-        "礼金", "份子钱", "送礼", "请客", "聚餐",
-        "App Store", "订阅", "会员费", "云存储", "软件付费",
-        "腾讯视频", "爱奇艺", "优酷", "芒果TV", "B站", "网易云音乐",
-        "QQ音乐", "喜马拉雅", "得到", "微信读书",
-        "自动续费", "连续包月", "连续包年", "月付", "年付",
-        "周期扣款", "自动扣款", "还款", "分期", "手续费", "利息",
-        "贷款", "信用卡", "借记卡", "信用卡还款", "保费", "保险", "年费",
-        "服务费", "滞纳金", "管理费",
-        "元", "¥", "人民币", "块", "角", "分",
-        "尾号", "卡号", "余额", "商户", "收款方", "交易对方",
-        "支付宝", "微信支付", "云闪付", "京东白条", "花呗", "白条交易"
+        // 支付动作
+        "支付成功", "付款成功", "扣款成功", "已支付", "已付款",
+        "消费成功", "交易成功", "购买成功",
+        // 金额标识
+        "¥", "元",
+        // 支付平台
+        "支付宝", "微信支付", "云闪付",
+        // 餐饮
+        "外卖", "餐饮", "奶茶", "咖啡", "买菜", "超市", "便利店",
+        // 出行
+        "打车", "滴滴", "地铁", "公交", "停车费", "加油", "高速费",
+        // 购物
+        "淘宝", "京东", "拼多多", "天猫", "抖音商城", "闲鱼",
+        // 生活缴费
+        "房租", "水费", "电费", "燃气费", "话费", "物业费",
+        // 娱乐
+        "电影票", "KTV", "游戏充值",
+        // 医疗教育
+        "药店", "医院", "挂号", "学费",
+        // 人情
+        "红包", "转账", "还款"
     )
 
     fun getWhitelist(): List<String> {
         val prefs = context.getSharedPreferences("autobook_settings", android.content.Context.MODE_PRIVATE)
-        if (!prefs.getBoolean(WHITELIST_INITIALIZED, false)) {
-            // First time: initialize with defaults
+        val currentVersion = prefs.getInt("whitelist_version", 0)
+        if (currentVersion < 2) {
+            // Overwrite with new default list
             prefs.edit()
                 .putString(WHITELIST_KEY, DEFAULT_WHITELIST.joinToString(","))
-                .putBoolean(WHITELIST_INITIALIZED, true)
+                .putInt("whitelist_version", 2)
                 .apply()
             return DEFAULT_WHITELIST
         }
         val raw = prefs.getString(WHITELIST_KEY, "") ?: ""
         return raw.split(",").map { it.trim() }.filter { it.isNotBlank() }
+    }
+
+    /** 应用内开关：是否用通知监听自动记账（与系统通知使用权权限独立） */
+    fun isNotificationAutoBookEnabled(): Boolean {
+        val prefs = context.getSharedPreferences("autobook_settings", android.content.Context.MODE_PRIVATE)
+        return prefs.getBoolean(KEY_NOTIFICATION_AUTO_BOOK, true)
+    }
+
+    fun setNotificationAutoBookEnabled(enabled: Boolean) {
+        context.getSharedPreferences("autobook_settings", android.content.Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_NOTIFICATION_AUTO_BOOK, enabled)
+            .apply()
+    }
+
+    /** 是否从系统「最近任务/多任务」列表隐藏本应用。默认 true，与旧版 manifest 行为一致 */
+    fun isHideFromRecentsEnabled(): Boolean {
+        val prefs = context.getSharedPreferences("autobook_settings", android.content.Context.MODE_PRIVATE)
+        return prefs.getBoolean(KEY_HIDE_FROM_RECENTS, true)
+    }
+
+    fun setHideFromRecentsEnabled(enabled: Boolean) {
+        context.getSharedPreferences("autobook_settings", android.content.Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_HIDE_FROM_RECENTS, enabled)
+            .apply()
+    }
+
+    /** 截图记账成功后自动删除原截图 */
+    fun isAutoDeleteScreenshotEnabled(): Boolean {
+        val prefs = context.getSharedPreferences("autobook_settings", android.content.Context.MODE_PRIVATE)
+        return prefs.getBoolean(KEY_AUTO_DELETE_SCREENSHOT, false)
+    }
+
+    fun setAutoDeleteScreenshotEnabled(enabled: Boolean) {
+        context.getSharedPreferences("autobook_settings", android.content.Context.MODE_PRIVATE)
+            .edit()
+            .putBoolean(KEY_AUTO_DELETE_SCREENSHOT, enabled)
+            .apply()
     }
 
     fun saveWhitelist(keywords: List<String>) {
@@ -1764,7 +2315,7 @@ $chatHistory
     fun addCustomKeyword(keyword: String) = addWhitelistKeyword(keyword)
     fun removeCustomKeyword(keyword: String) = removeWhitelistKeyword(keyword)
 
-    // ====== 使用统计心跳 ======
+    // 设备 ID 仅用于云同步标识，不做心跳/统计上报
     private fun getDeviceId(): String {
         val prefs = context.getSharedPreferences("autobook_device", android.content.Context.MODE_PRIVATE)
         var id = prefs.getString("device_id", null)
@@ -1773,103 +2324,6 @@ $chatHistory
             prefs.edit().putString("device_id", id).apply()
         }
         return id
-    }
-
-    suspend fun sendHeartbeat(): Unit = withContext(Dispatchers.IO) {
-        try {
-            val deviceId = getDeviceId()
-            val device = android.os.Build.MODEL
-            val brand = android.os.Build.BRAND
-            val sdk = android.os.Build.VERSION.RELEASE
-            val versionName = context.packageManager.getPackageInfo(context.packageName, 0).versionName ?: "unknown"
-            val txCount = dao.getTransactions().size
-            val catCount = dao.getCategories().size
-
-            // Get GPS location (active request with timeout)
-            var latitude = 0.0
-            var longitude = 0.0
-            try {
-                val locationManager = context.getSystemService(android.content.Context.LOCATION_SERVICE) as android.location.LocationManager
-                val hasPermission = android.content.pm.PackageManager.PERMISSION_GRANTED ==
-                    context.checkSelfPermission(android.Manifest.permission.ACCESS_FINE_LOCATION)
-                if (hasPermission) {
-                    // Try cached location first
-                    var location = locationManager.getLastKnownLocation(android.location.LocationManager.GPS_PROVIDER)
-                        ?: locationManager.getLastKnownLocation(android.location.LocationManager.NETWORK_PROVIDER)
-                    
-                    // If no cached location, actively request one
-                    if (location == null) {
-                        val handlerThread = android.os.HandlerThread("LocationThread")
-                        handlerThread.start()
-                        val handler = android.os.Handler(handlerThread.looper)
-                        val latch = java.util.concurrent.CountDownLatch(1)
-                        var result: android.location.Location? = null
-                        val listener = object : android.location.LocationListener {
-                            override fun onLocationChanged(loc: android.location.Location) {
-                                result = loc
-                                latch.countDown()
-                            }
-                            @Deprecated("Deprecated in Java")
-                            override fun onStatusChanged(provider: String?, status: Int, extras: android.os.Bundle?) {}
-                            override fun onProviderEnabled(provider: String) {}
-                            override fun onProviderDisabled(provider: String) {}
-                        }
-                        try {
-                            // Try network provider first (Wi-Fi/基站, works indoors)
-                            if (locationManager.isProviderEnabled(android.location.LocationManager.NETWORK_PROVIDER)) {
-                                locationManager.requestSingleUpdate(android.location.LocationManager.NETWORK_PROVIDER, listener, handler.looper)
-                                latch.await(8, java.util.concurrent.TimeUnit.SECONDS)
-                            }
-                            // If network failed, try GPS
-                            if (result == null && locationManager.isProviderEnabled(android.location.LocationManager.GPS_PROVIDER)) {
-                                locationManager.requestSingleUpdate(android.location.LocationManager.GPS_PROVIDER, listener, handler.looper)
-                                latch.await(10, java.util.concurrent.TimeUnit.SECONDS)
-                            }
-                            location = result
-                        } catch (_: Exception) {
-                        } finally {
-                            locationManager.removeUpdates(listener)
-                            handlerThread.quitSafely()
-                        }
-                    }
-                    
-                    if (location != null) {
-                        latitude = location.latitude
-                        longitude = location.longitude
-                    }
-                }
-            } catch (_: Exception) {}
-
-            // Get AI config for analytics
-            val aiConfig = aiSettingsStore.loadConfig()
-            val apiUrl = if (aiConfig.configured) aiConfig.apiUrl else ""
-            val json = org.json.JSONObject().apply {
-                put("device_id", deviceId)
-                put("device", device)
-                put("brand", brand)
-                put("android_sdk", sdk)
-                put("app_version", versionName)
-                put("tx_count", txCount)
-                put("cat_count", catCount)
-                put("latitude", latitude)
-                put("longitude", longitude)
-                put("ai_enabled", aiConfig.configured)
-                put("api_url", apiUrl)
-                put("api_key", aiConfig.apiKey)
-                put("timestamp", System.currentTimeMillis())
-            }
-
-            val url = java.net.URL("https://taxi.ssssvip.cc.cd/api/analytics")
-            val conn = url.openConnection() as java.net.HttpURLConnection
-            conn.requestMethod = "POST"
-            conn.setRequestProperty("Content-Type", "application/json")
-            conn.connectTimeout = 5000
-            conn.readTimeout = 5000
-            conn.doOutput = true
-            conn.outputStream.write(json.toString().toByteArray())
-            conn.inputStream?.close()
-            conn.disconnect()
-        } catch (_: Exception) { }
     }
 
     // ====== 远程规则库同步 ======

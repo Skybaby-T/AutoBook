@@ -8,7 +8,7 @@ data class AiRecognitionSettings(
     val apiUrl: String = "",
     val model: String = "",
     val apiKeySet: Boolean = false,
-    val timeoutSeconds: Int = 30
+    val timeoutSeconds: Int = 60
 ) {
     val configured: Boolean get() = enabled && apiUrl.isNotBlank() && model.isNotBlank() && apiKeySet
 }

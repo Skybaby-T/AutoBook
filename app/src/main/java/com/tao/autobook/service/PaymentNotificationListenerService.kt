@@ -18,6 +18,11 @@ class PaymentNotificationListenerService : NotificationListenerService() {
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification) {
+        val app = application as AutoBookApplication
+        // 应用内开关：关闭后即使系统权限开着也不自动记账
+        if (!app.repository.isNotificationAutoBookEnabled()) {
+            return
+        }
         val extras = sbn.notification.extras
         val title = extras.getCharSequence("android.title")?.toString()
         val text = listOfNotNull(
@@ -26,7 +31,6 @@ class PaymentNotificationListenerService : NotificationListenerService() {
             extras.getCharSequence("android.subText")?.toString()
         ).joinToString(" ")
         scope.launch {
-            val app = application as AutoBookApplication
             val result = app.repository.captureNotification(sbn.packageName, title, text)
             if (result.created && result.transaction != null) {
                 AutoBookNotifier.notifyTransaction(this@PaymentNotificationListenerService, result.transaction, app.getDao().getCategories())
