@@ -89,12 +89,14 @@ class MainActivity : ComponentActivity() {
         var notificationAutoBookEnabled by remember { mutableStateOf(vm.isNotificationAutoBookEnabled()) }
         var hideFromRecents by remember { mutableStateOf(vm.isHideFromRecentsEnabled()) }
         var autoDeleteScreenshot by remember { mutableStateOf(vm.isAutoDeleteScreenshotEnabled()) }
+        var monthStartDay by remember { mutableStateOf(vm.getMonthStartDay()) }
         // 启动时按设置同步「最近任务隐藏」
         LaunchedEffect(Unit) { setExcludeFromRecents(hideFromRecents) }
         val state by vm.state.collectAsState()
         val chatMessages by vm.chatMessages.collectAsState()
         val isChatSending by vm.isChatSending.collectAsState()
         val customKeywords by vm.customKeywords.collectAsState()
+        val report by vm.report.collectAsState()
         var openTransactionId by remember { mutableStateOf(pendingTransactionId.value) }
         var notice by remember { mutableStateOf<com.tao.autobook.notify.AutoBookNotice?>(null) }
         val pickScreenshots = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia()) { uris ->
@@ -184,6 +186,7 @@ class MainActivity : ComponentActivity() {
             onUpdateTransactionWithApp = { id, m, a, c, t, p, n, app -> vm.updateTransactionWithApp(id, m, a, c, t, p, n, app) },
             onSaveCategory = vm::saveCategory,
             onDeleteCategory = vm::deleteCategory,
+            onMoveCategory = vm::moveCategory,
             onExportCsv = { vm.exportCsv(::shareCsv) },
             onImportBills = { pickBillFiles.launch(arrayOf("text/*", "text/csv", "text/plain", "application/csv", "application/vnd.ms-excel", "application/octet-stream")) },
             onSaveAiSettings = vm::saveAiSettings,
@@ -269,6 +272,19 @@ class MainActivity : ComponentActivity() {
             },
             onAddNotificationRule = vm::addNotificationRule,
             onDeleteNotificationRule = vm::deleteNotificationRule,
+            report = report,
+            onReportPeriod = vm::setReportPeriod,
+            onReportType = vm::setReportType,
+            onReportShift = vm::shiftReportPeriod,
+            onReportCustomRange = vm::setReportCustomRange,
+            onReportDrill = vm::toggleReportDrill,
+            onSaveBudget = vm::saveBudget,
+            onUpdateTransactionFull = vm::updateTransactionFull,
+            monthStartDay = monthStartDay,
+            onMonthStartDayChange = {
+                vm.setMonthStartDay(it)
+                monthStartDay = it
+            },
         )
 
 

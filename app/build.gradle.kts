@@ -16,8 +16,8 @@ android {
         applicationId = "com.tao.autobook"
         minSdk = 31
         targetSdk = 36
-        versionCode = 30
-                        versionName = "1.0.29"
+        versionCode = 34
+                        versionName = "1.0.33"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
@@ -99,7 +99,6 @@ dependencies {
     implementation("androidx.paging:paging-runtime-ktx:3.3.0")
     implementation("androidx.paging:paging-compose:3.3.0")
     implementation("androidx.exifinterface:exifinterface:1.3.7")
-    implementation("androidx.security:security-crypto:1.1.0-alpha06")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.8.1")
 
     implementation("com.google.mlkit:text-recognition:16.0.1")

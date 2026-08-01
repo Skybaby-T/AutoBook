@@ -9,7 +9,6 @@ import com.tao.autobook.ai.AiRecognitionConfig
 import com.tao.autobook.ai.AiRecognitionSettings
 import com.tao.autobook.ai.AiScreenshotRecognizer
 import com.tao.autobook.ai.AiSettingsStore
-import com.tao.autobook.storage.SecurePrefs
 import com.tao.autobook.data.AutoBookLogEntry
 import com.tao.autobook.data.NotificationRuleEntity
 import com.tao.autobook.data.NotificationMatchType
@@ -37,6 +36,12 @@ private const val DEDUP_WINDOW_MS: Long = 300_000L
 private const val LOG_RETENTION_MS: Long = 30L * 24 * 60 * 60 * 1000
 private const val LEDGER_DISPLAY_LIMIT = 500
 private const val CHAT_CONTEXT_LIMIT = 100
+/** 报表排行榜取前 N 名 */
+private const val REPORT_RANK_LIMIT = 10
+/** 分类下钻明细最多取 N 笔 */
+private const val REPORT_DRILL_TX_LIMIT = 30
+/** 一天的毫秒数 */
+private const val DAY_MS: Long = 24 * 60 * 60 * 1000L
 /** 单笔最大金额：1亿人民币（分）。超此视为脏数据 */
 private const val MAX_AMOUNT_CENTS: Long = 10_000_000_000L // 1e8 元 * 100
 
@@ -51,8 +56,7 @@ class AutoBookRepository(
     private val cryptoStore: CryptoStore = CryptoStore(),
     private val ocrRecognizer: OcrRecognizer = OcrRecognizer(),
     private val aiSettingsStore: AiSettingsStore = AiSettingsStore(context),
-    private val aiRecognizer: AiScreenshotRecognizer = AiScreenshotRecognizer(),
-    private val securePrefs: SecurePrefs = SecurePrefs(context)
+    private val aiRecognizer: AiScreenshotRecognizer = AiScreenshotRecognizer()
 ) {
     private val aiMutex = Mutex()
     private var lastAiCallTime = 0L
@@ -587,7 +591,9 @@ class AutoBookRepository(
         paidAt: Long,
         note: String,
         type: TransactionType,
-        paymentApp: PaymentApp
+        paymentApp: PaymentApp,
+        excludeFromStats: Boolean? = null,
+        excludeFromBudget: Boolean? = null
     ) = withContext(Dispatchers.IO) {
         val existing = dao.getTransaction(id) ?: return@withContext
         val updated = existing.copy(
@@ -598,6 +604,8 @@ class AutoBookRepository(
             paidAt = paidAt,
             note = note,
             type = type,
+            excludeFromStats = excludeFromStats ?: existing.excludeFromStats,
+            excludeFromBudget = excludeFromBudget ?: existing.excludeFromBudget,
             updatedAt = System.currentTimeMillis()
         )
         dao.updateTransaction(updated)
@@ -629,6 +637,34 @@ class AutoBookRepository(
 
     suspend fun upsertCategory(category: CategoryEntity) = withContext(Dispatchers.IO) {
         dao.upsertCategory(category)
+    }
+
+    /**
+     * 分类上移/下移。
+     * 同级列表（同 type 且同 parentId）内按当前顺序找相邻项交换 sortOrder。
+     * 交换前先规整化一遍，避免历史数据里 sortOrder 重复导致换了没反应。
+     */
+    suspend fun moveCategory(categoryId: String, up: Boolean): Boolean = withContext(Dispatchers.IO) {
+        val all = dao.getCategories()
+        val target = all.firstOrNull { it.id == categoryId } ?: return@withContext false
+        val siblings = all.filter { it.type == target.type && it.parentId == target.parentId }
+            .sortedBy { it.sortOrder }
+        if (siblings.size < 2) return@withContext false
+        // 规整化：去掉重复 sortOrder
+        val needNormalize = siblings.map { it.sortOrder }.toSet().size != siblings.size
+        val ordered = if (needNormalize) {
+            dao.normalizeCategoryOrder(siblings.map { it.id })
+            dao.getCategories().filter { it.type == target.type && it.parentId == target.parentId }
+                .sortedBy { it.sortOrder }
+        } else siblings
+        val index = ordered.indexOfFirst { it.id == categoryId }
+        if (index < 0) return@withContext false
+        val swapIndex = if (up) index - 1 else index + 1
+        if (swapIndex !in ordered.indices) return@withContext false
+        val a = ordered[index]
+        val b = ordered[swapIndex]
+        dao.swapCategoryOrder(a.id, a.sortOrder, b.id, b.sortOrder)
+        true
     }
 
     suspend fun deleteCategoryAndMoveTransactions(categoryId: String) = withContext(Dispatchers.IO) {
@@ -1267,6 +1303,12 @@ class AutoBookRepository(
 
     private fun chooseCategory(parsed: ParsedPayment, rules: List<MerchantRuleEntity>): String {
         categoryFromHint(parsed.categoryHint, parsed.type)?.let { return it }
+        // hint 没给出可用分类时，用商户名 + 备注再试一次二级分类
+        // 场景：AI 只回「生活缴费」，但商户是「国网安徽省合肥市电力公司」，应落到「电费」
+        if (parsed.type == TransactionType.EXPENSE) {
+            val extra = listOf(parsed.merchantName, parsed.note).joinToString(" ").trim()
+            if (extra.isNotBlank()) subCategoryFromHint(extra)?.let { return it }
+        }
         return when (parsed.type) {
             TransactionType.EXPENSE -> classifier.classify(parsed.merchantName, parsed.rawText, rules, parsed.paymentApp)
             TransactionType.INCOME -> classifyIncome(parsed.merchantName, parsed.rawText)
@@ -1278,7 +1320,8 @@ class AutoBookRepository(
         val text = hint.trim()
         if (text.isBlank()) return null
         return when (type) {
-            TransactionType.EXPENSE -> when {
+            // 先匹配二级分类（更精确），命中不了再退回一级分类
+            TransactionType.EXPENSE -> subCategoryFromHint(text) ?: when {
                 listOf("餐", "外卖", "奶茶", "咖啡", "美食").any { text.contains(it) } -> BuiltInCategories.FOOD
                 listOf("交通", "打车", "地铁", "公交", "出行").any { text.contains(it) } -> BuiltInCategories.TRANSPORT
                 listOf("购物", "电商", "淘宝", "天猫", "京东", "抖音", "拼多多", "服饰", "数码").any { text.contains(it) } -> BuiltInCategories.SHOPPING
@@ -1299,6 +1342,41 @@ class AutoBookRepository(
             }
             TransactionType.OTHER -> null
         }
+    }
+
+    /**
+     * 二级分类命中。
+     * 顺序很重要：先判更具体的词（「电费」在「缴费」之前），避免「电费充值」只落到「生活缴费」。
+     */
+    private fun subCategoryFromHint(text: String): String? = when {
+        // 生活缴费下钻
+        listOf("电费", "电力", "供电", "国网", "购电", "充电费").any { text.contains(it) } -> BuiltInCategories.BILLS_ELECTRIC
+        listOf("水费", "自来水", "供水", "水务").any { text.contains(it) } -> BuiltInCategories.BILLS_WATER
+        listOf("燃气", "天然气", "煤气", "燃气费", "燃气公司").any { text.contains(it) } -> BuiltInCategories.BILLS_GAS
+        listOf("房租", "租金", "月租", "押一付").any { text.contains(it) } -> BuiltInCategories.BILLS_RENT
+        listOf("宽带", "网费", "话费", "流量费", "手机充值", "电信", "联通", "移动通信").any { text.contains(it) } -> BuiltInCategories.BILLS_INTERNET
+        // 餐饮下钻
+        listOf("早餐", "早点", "包子", "豆浆").any { text.contains(it) } -> BuiltInCategories.FOOD_BREAKFAST
+        listOf("午餐", "中饭", "午饭").any { text.contains(it) } -> BuiltInCategories.FOOD_LUNCH
+        listOf("晚餐", "晚饭", "夜宵").any { text.contains(it) } -> BuiltInCategories.FOOD_DINNER
+        listOf("外卖", "骑手", "美团外卖", "饿了么").any { text.contains(it) } -> BuiltInCategories.FOOD_TAKEOUT
+        listOf("零食", "薯片", "饼干", "糖").any { text.contains(it) } -> BuiltInCategories.FOOD_SNACK
+        listOf("水果", "生鲜果").any { text.contains(it) } -> BuiltInCategories.FOOD_FRUIT
+        // 交通下钻
+        listOf("加油", "汽油", "柴油", "中石化", "中石油", "充电桩", "换电").any { text.contains(it) } -> BuiltInCategories.TRANSPORT_FUEL
+        listOf("打车", "网约车", "滴滴", "出租车", "快车", "专车").any { text.contains(it) } -> BuiltInCategories.TRANSPORT_TAXI
+        listOf("地铁", "轨道交通").any { text.contains(it) } -> BuiltInCategories.TRANSPORT_METRO
+        listOf("公交", "巴士", "公共交通").any { text.contains(it) } -> BuiltInCategories.TRANSPORT_BUS
+        listOf("停车", "车位").any { text.contains(it) } -> BuiltInCategories.TRANSPORT_PARKING
+        // 购物下钻（放在娱乐前：「运动鞋」应归服装，不是运动）
+        listOf("服装", "衣服", "鞋", "裤", "外套", "服饰", "T恤", "卫衣").any { text.contains(it) } -> BuiltInCategories.SHOPPING_CLOTHES
+        listOf("日用", "纸巾", "洗衣", "牙膏", "清洁").any { text.contains(it) } -> BuiltInCategories.SHOPPING_DAILY
+        listOf("数码", "手机", "电脑", "耳机", "充电器", "配件").any { text.contains(it) } -> BuiltInCategories.SHOPPING_DIGITAL
+        // 娱乐下钻
+        listOf("游戏", "点券", "皮肤", "手游", "steam").any { text.contains(it, ignoreCase = true) } -> BuiltInCategories.ENTERTAINMENT_GAME
+        listOf("电影", "影城", "影院", "票房").any { text.contains(it) } -> BuiltInCategories.ENTERTAINMENT_MOVIE
+        listOf("健身", "球馆", "游泳", "运动馆", "运动中心", "羽毛球", "篮球场").any { text.contains(it) } -> BuiltInCategories.ENTERTAINMENT_SPORT
+        else -> null
     }
 
     private fun combineOcrAndAi(ocrText: String, ai: AiParsedPayment?, aiError: String? = null): String {
@@ -1503,17 +1581,96 @@ class AutoBookRepository(
     // ====== AI 对话 ======
         // ====== 统计聚合 ======
         suspend fun getMonthExpense(start: Long): Long = withContext(Dispatchers.IO) {
-            runCatching { dao.getMonthExpense(start) }.getOrDefault(0L)
+            runCatching { dao.getExpenseBetween(start, monthEndMillisFrom(start)) }.getOrDefault(0L)
         }
         suspend fun getMonthIncome(start: Long): Long = withContext(Dispatchers.IO) {
-            runCatching { dao.getMonthIncome(start) }.getOrDefault(0L)
+            runCatching { dao.getIncomeBetween(start, monthEndMillisFrom(start)) }.getOrDefault(0L)
         }
         suspend fun getTodayExpense(start: Long): Long = withContext(Dispatchers.IO) {
-            runCatching { dao.getTodayExpense(start) }.getOrDefault(0L)
+            runCatching { dao.getExpenseBetween(start, start + DAY_MS - 1) }.getOrDefault(0L)
         }
         suspend fun getTodayIncome(start: Long): Long = withContext(Dispatchers.IO) {
-            runCatching { dao.getTodayIncome(start) }.getOrDefault(0L)
+            runCatching { dao.getIncomeBetween(start, start + DAY_MS - 1) }.getOrDefault(0L)
         }
+
+        /** 由「月周期起点」推出该周期终点（起点 + 1 个月 - 1ms），兼容自定义月周期起始日 */
+        private fun monthEndMillisFrom(start: Long): Long {
+            val zone = java.time.ZoneId.systemDefault()
+            val startDate = java.time.Instant.ofEpochMilli(start).atZone(zone).toLocalDate()
+            return startDate.plusMonths(1).atStartOfDay(zone).toInstant().toEpochMilli() - 1
+        }
+
+        // ====== 报表聚合 ======
+        /**
+         * 一次性拉齐某个区间的全部报表数据。
+         * 全走 SQL 聚合，避免 UI 层对「最近 500 条」内存列表做统计导致年报失真。
+         *
+         * @param start 区间起点（含）
+         * @param end 区间终点（含）
+         * @param type 支出 / 收入
+         * @param prevStart 上一周期起点，用于环比；为 null 时环比返回 0
+         * @param prevEnd 上一周期终点
+         */
+        suspend fun loadReport(
+            start: Long,
+            end: Long,
+            type: TransactionType,
+            prevStart: Long?,
+            prevEnd: Long?,
+        ): ReportSnapshot = withContext(Dispatchers.IO) {
+            val counterType = if (type == TransactionType.EXPENSE) TransactionType.INCOME else TransactionType.EXPENSE
+            runCatching {
+                val excluded = dao.getExcludedSummary(start, end)
+                ReportSnapshot(
+                    summary = dao.getRangeSummary(start, end, type),
+                    prevTotal = if (prevStart != null && prevEnd != null) dao.getRangeSummary(prevStart, prevEnd, type).total else 0L,
+                    counterTotal = dao.getRangeSummary(start, end, counterType).total,
+                    categories = dao.getCategoryTotals(start, end, type),
+                    merchants = dao.getMerchantTotals(start, end, type, REPORT_RANK_LIMIT),
+                    paymentApps = dao.getPaymentAppTotals(start, end, type),
+                    days = dao.getDayTotals(start, end, type),
+                    months = dao.getMonthTotals(start, end, type),
+                    weekdays = dao.getWeekdayTotals(start, end, type),
+                    budgetSpent = dao.getBudgetSpent(start, end, type),
+                    budgetCategories = dao.getBudgetCategoryTotals(start, end, type),
+                    excludedTotal = excluded.total,
+                    excludedCount = excluded.cnt,
+                )
+            }.getOrElse { ReportSnapshot() }
+        }
+
+        /** 分类下钻：该分类在区间内的商家排行 + 大额明细 */
+        suspend fun loadCategoryDrillDown(
+            start: Long,
+            end: Long,
+            type: TransactionType,
+            categoryId: String,
+        ): CategoryDrillDown = withContext(Dispatchers.IO) {
+            runCatching {
+                CategoryDrillDown(
+                    merchants = dao.getMerchantTotalsInCategory(start, end, type, categoryId, REPORT_RANK_LIMIT),
+                    transactions = dao.getTransactionsInCategoryRange(start, end, type, categoryId, REPORT_DRILL_TX_LIMIT),
+                )
+            }.getOrElse { CategoryDrillDown() }
+        }
+
+        /** 最早一笔账单时间，用于「全部」区间 */
+        suspend fun getEarliestPaidAt(): Long? = withContext(Dispatchers.IO) {
+            runCatching { dao.getEarliestPaidAt() }.getOrNull()
+        }
+
+        // ====== 预算 ======
+        fun observeBudgets(): Flow<List<BudgetEntity>> = dao.observeBudgets()
+
+        suspend fun saveBudget(categoryId: String, amountCents: Long) = withContext(Dispatchers.IO) {
+            if (amountCents <= 0L) {
+                dao.deleteBudget(categoryId)
+            } else {
+                dao.upsertBudget(BudgetEntity(categoryId, amountCents, System.currentTimeMillis()))
+            }
+        }
+
+        suspend fun clearBudgets() = withContext(Dispatchers.IO) { dao.clearBudgets() }
 
         private fun sanitizeAmountCents(amountCents: Long): Long {
             return when {
@@ -1977,114 +2134,6 @@ $chatHistory
         }
     }
 
-    // ====== 云同步 ======
-    private val SYNC_URL = "https://taxi.ssssvip.cc.cd/api/sync"
-    private val SYNC_PREFS = "autobook_sync"
-
-    fun getSyncConfig(): Pair<String, String> {
-        // 迁移：如果旧 SharedPreferences 中有明文密码，迁移到加密存储后清除
-        val oldPrefs = context.getSharedPreferences(SYNC_PREFS, android.content.Context.MODE_PRIVATE)
-        val oldUser = oldPrefs.getString("username", "") ?: ""
-        val oldPass = oldPrefs.getString("password", "") ?: ""
-        if (oldPass.isNotEmpty()) {
-            securePrefs.saveSyncCredentials(oldUser, oldPass)
-            oldPrefs.edit().remove("username").remove("password").apply()
-        }
-        return securePrefs.getSyncCredentials()
-    }
-
-    fun saveSyncConfig(username: String, password: String) {
-        securePrefs.saveSyncCredentials(username, password)
-    }
-
-    suspend fun syncPush(): String = withContext(Dispatchers.IO) {
-        val (username, password) = getSyncConfig()
-        if (username.isBlank() || password.isBlank()) return@withContext "请先配置同步账号"
-
-        val backup = exportBackup()
-        val payload = org.json.JSONObject()
-        payload.put("action", "push")
-        payload.put("username", username)
-        payload.put("password", password)
-        payload.put("device_id", getDeviceId())
-        payload.put("device_name", "${android.os.Build.BRAND} ${android.os.Build.MODEL}")
-        payload.put("payload", backup)
-
-        val urls = if (com.tao.autobook.BuildConfig.DEBUG) {
-            listOf(SYNC_URL, "http://192.168.1.89:8000/api/sync")
-        } else {
-            listOf(SYNC_URL)
-        }
-        try {
-            for (url in urls) {
-                try {
-                    val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
-                    conn.requestMethod = "POST"
-                    conn.setRequestProperty("Content-Type", "application/json")
-                    conn.setRequestProperty("User-Agent", "AutoBook/${android.os.Build.VERSION.RELEASE}")
-                    conn.connectTimeout = 8000
-                    conn.readTimeout = 8000
-                    conn.doOutput = true
-                    conn.outputStream.write(payload.toString().toByteArray())
-                    val code = conn.responseCode
-                    conn.disconnect()
-                    if (code in 200..299) return@withContext "推送成功"
-                } catch (_: Exception) { }
-            }
-            "推送失败: 服务器不可达，请检查网络"
-        } catch (e: Exception) {
-            "推送失败: ${e.message?.take(50)}"
-        }
-    }
-
-    suspend fun syncPull(): String = withContext(Dispatchers.IO) {
-        val (username, password) = getSyncConfig()
-        if (username.isBlank() || password.isBlank()) return@withContext "请先配置同步账号"
-
-        val payload = org.json.JSONObject()
-        payload.put("action", "pull")
-        payload.put("username", username)
-        payload.put("password", password)
-        payload.put("device_id", getDeviceId())
-        payload.put("device_name", "${android.os.Build.BRAND} ${android.os.Build.MODEL}")
-
-        val urls = if (com.tao.autobook.BuildConfig.DEBUG) {
-            listOf(SYNC_URL, "http://192.168.1.89:8000/api/sync")
-        } else {
-            listOf(SYNC_URL)
-        }
-        for (url in urls) {
-            try {
-                val conn = java.net.URL(url).openConnection() as java.net.HttpURLConnection
-                conn.requestMethod = "POST"
-                conn.setRequestProperty("Content-Type", "application/json")
-                conn.setRequestProperty("User-Agent", "AutoBook/${android.os.Build.VERSION.RELEASE}")
-                conn.connectTimeout = 30000
-                conn.readTimeout = 30000
-                conn.doOutput = true
-                conn.outputStream.write(payload.toString().toByteArray())
-                val code = conn.responseCode
-                val resp = if (code in 200..299) {
-                    conn.inputStream.bufferedReader().readText()
-                } else {
-                    conn.errorStream?.bufferedReader()?.readText() ?: "Error $code"
-                }
-                conn.disconnect()
-                if (code !in 200..299) continue
-                val respJson = org.json.JSONObject(resp)
-                if (respJson.optInt("code") == 200) {
-                    val data = respJson.optJSONObject("detail")
-                    if (data != null) {
-                        val result = importBackup(data)
-                        return@withContext "拉取成功，$result"
-                    }
-                }
-                return@withContext "拉取失败: ${respJson.optString("detail", "未知错误")}"
-            } catch (_: Exception) { }
-        }
-        "拉取失败: 所有服务器均不可达"
-    }
-
     suspend fun importBackup(json: org.json.JSONObject): String = withContext(Dispatchers.IO) {
         var imported = 0
         var skipped = 0
@@ -2212,6 +2261,7 @@ $chatHistory
     private val KEY_NOTIFICATION_AUTO_BOOK = "notification_auto_book_enabled"
     private val KEY_HIDE_FROM_RECENTS = "hide_from_recents"
     private val KEY_AUTO_DELETE_SCREENSHOT = "auto_delete_screenshot"
+    private val KEY_MONTH_START_DAY = "month_start_day"
 
     private val DEFAULT_WHITELIST = listOf(
         // 支付动作
@@ -2291,6 +2341,28 @@ $chatHistory
             .apply()
     }
 
+    /**
+     * 月度周期起始日（1-28）。默认 1 = 自然月。
+     * 设成 10 表示「本月」= 本月 10 日 至 次月 9 日，适合按工资日理财。
+     * 上限 28 是为了避免 2 月没有 29/30/31 号。
+     */
+    fun getMonthStartDay(): Int {
+        val prefs = context.getSharedPreferences("autobook_settings", android.content.Context.MODE_PRIVATE)
+        return prefs.getInt(KEY_MONTH_START_DAY, 1).coerceIn(1, 28)
+    }
+
+    fun setMonthStartDay(day: Int) {
+        context.getSharedPreferences("autobook_settings", android.content.Context.MODE_PRIVATE)
+            .edit()
+            .putInt(KEY_MONTH_START_DAY, day.coerceIn(1, 28))
+            .apply()
+    }
+
+    /** 标记/取消「不计入收支」与「不计入预算」 */
+    suspend fun updateExcludeFlags(id: Long, excludeStats: Boolean, excludeBudget: Boolean) = withContext(Dispatchers.IO) {
+        dao.updateExcludeFlags(id, excludeStats, excludeBudget, System.currentTimeMillis())
+    }
+
     fun saveWhitelist(keywords: List<String>) {
         val prefs = context.getSharedPreferences("autobook_settings", android.content.Context.MODE_PRIVATE)
         prefs.edit().putString(WHITELIST_KEY, keywords.joinToString(",")).apply()
@@ -2314,17 +2386,6 @@ $chatHistory
     fun getCustomWhitelist(): List<String> = getWhitelist()
     fun addCustomKeyword(keyword: String) = addWhitelistKeyword(keyword)
     fun removeCustomKeyword(keyword: String) = removeWhitelistKeyword(keyword)
-
-    // 设备 ID 仅用于云同步标识，不做心跳/统计上报
-    private fun getDeviceId(): String {
-        val prefs = context.getSharedPreferences("autobook_device", android.content.Context.MODE_PRIVATE)
-        var id = prefs.getString("device_id", null)
-        if (id == null) {
-            id = java.util.UUID.randomUUID().toString().take(12)
-            prefs.edit().putString("device_id", id).apply()
-        }
-        return id
-    }
 
     // ====== 远程规则库同步 ======
     companion object {

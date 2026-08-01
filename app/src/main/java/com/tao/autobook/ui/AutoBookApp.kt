@@ -26,6 +26,7 @@ import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -46,6 +47,10 @@ import androidx.compose.material.icons.filled.CreditScore
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DirectionsCar
 import androidx.compose.material.icons.filled.Edit
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.FileUpload
 import androidx.compose.material.icons.filled.FileDownload
 import androidx.compose.material.icons.filled.Group
@@ -141,25 +146,25 @@ import java.time.format.DateTimeFormatter
 import kotlin.math.max
 
 private val AppBackground = Color(0xFFF4F6FA)
-private val CardWhite = Color(0xFFFFFFFF)
-private val Ink = Color(0xFF121820)
-private val Muted = Color(0xFF7D8792)
-private val Line = Color(0xFFE8ECF2)
-private val Blue = Color(0xFF4C8DCE)
+internal val CardWhite = Color(0xFFFFFFFF)
+internal val Ink = Color(0xFF121820)
+internal val Muted = Color(0xFF7D8792)
+internal val Line = Color(0xFFE8ECF2)
+internal val Blue = Color(0xFF4C8DCE)
 private val BlueSoft = Color(0xFFEAF4FB)
 private val Green = Color(0xFF10B981)
 private val Orange = Color(0xFFEBA35D)
-private val Red = Color(0xFFD86B64)
+internal val Red = Color(0xFFD86B64)
 private val Teal = Color(0xFF56A89A)
-private val FreshBlue = Color(0xFF6BAED6)
-private val FreshMint = Color(0xFF7BCBB8)
-private val FreshCoral = Color(0xFFFF9B8A)
+internal val FreshBlue = Color(0xFF6BAED6)
+internal val FreshMint = Color(0xFF7BCBB8)
+internal val FreshCoral = Color(0xFFFF9B8A)
 private val FreshLavender = Color(0xFFAFA7E8)
 private val FreshYellow = Color(0xFFF2C879)
 private val FreshAqua = Color(0xFF78C6D0)
-private val FreshPalette = listOf(FreshMint, FreshBlue, FreshCoral, FreshYellow, FreshLavender, FreshAqua, Color(0xFF95D5B2), Color(0xFFFFC6A5))
+internal val FreshPalette = listOf(FreshMint, FreshBlue, FreshCoral, FreshYellow, FreshLavender, FreshAqua, Color(0xFF95D5B2), Color(0xFFFFC6A5))
 
-private data class ChartSeries(val values: List<Long>, val labels: List<String>)
+internal data class ChartSeries(val values: List<Long>, val labels: List<String>)
 
 enum class Tab(val label: String, val icon: ImageVector) {
     Ledger("记账", Icons.Default.Book),
@@ -167,8 +172,6 @@ enum class Tab(val label: String, val icon: ImageVector) {
     Report("报表", Icons.Default.BarChart),
     Settings("设置", Icons.Default.Settings)
 }
-
-enum class ReportRange(val label: String) { Week("周报"), Month("月报"), Year("年报") }
 
 @Composable
 fun AutoBookApp(
@@ -193,6 +196,7 @@ fun AutoBookApp(
     onUpdateTransactionWithApp: (Long, String, String, String, TransactionType, Long, String, com.tao.autobook.data.PaymentApp) -> Unit = { _, _, _, _, _, _, _, _ -> },
     onSaveCategory: (CategoryEntity?, String, TransactionType, Long, String, String?) -> Unit,
     onDeleteCategory: (CategoryEntity) -> Unit,
+    onMoveCategory: (CategoryEntity, Boolean) -> Unit = { _, _ -> },
     onExportCsv: () -> Unit,
     onImportBills: () -> Unit,
     onSaveAiSettings: (AiRecognitionSettings, String?) -> Unit,
@@ -244,12 +248,20 @@ fun AutoBookApp(
     onExportBackup: () -> Unit = {},
     onImportBackup: (String) -> Unit = {},
     onImportBackupClick: () -> Unit = {},
-    onSyncPush: (String, String) -> Unit = { _, _ -> },
-    onSyncPull: (String, String) -> Unit = { _, _ -> },
-    onSyncConfig: (String, String) -> Unit = { _, _ -> },
-    syncConfig: Pair<String, String> = Pair("", ""),
     onAddNotificationRule: (String, String, PaymentApp, NotificationMatchType) -> Unit,
-    onDeleteNotificationRule: (Long) -> Unit
+    onDeleteNotificationRule: (Long) -> Unit,
+    // 报表页：状态与回调
+    report: ReportUiState = ReportUiState(),
+    onReportPeriod: (ReportPeriod) -> Unit = {},
+    onReportType: (TransactionType) -> Unit = {},
+    onReportShift: (Long) -> Unit = {},
+    onReportCustomRange: (java.time.LocalDate, java.time.LocalDate) -> Unit = { _, _ -> },
+    onReportDrill: (String) -> Unit = {},
+    onSaveBudget: (String, String) -> Unit = { _, _ -> },
+    /** 保存账单（含不计入收支/不计入预算标记） */
+    onUpdateTransactionFull: (Long, String, String, String, TransactionType, Long, String, com.tao.autobook.data.PaymentApp, Boolean, Boolean) -> Unit = { _, _, _, _, _, _, _, _, _, _ -> },
+    monthStartDay: Int = 1,
+    onMonthStartDayChange: (Int) -> Unit = {}
 ) {
     var tab by remember { mutableStateOf(Tab.Ledger) }
     var editingTransaction by remember { mutableStateOf<TransactionEntity?>(null) }
@@ -416,14 +428,23 @@ fun AutoBookApp(
                         }
                     )
                 } else if (showCategoryManager) {
-                    CategoryManagerScreen(state, onSaveCategory, onDeleteCategory)
+                    CategoryManagerScreen(state, onSaveCategory, onDeleteCategory, onMoveCategory)
                 } else if (showPendingReview) {
                     PendingReviewScreen(state, onConfirmPending, onIgnorePending, onClearAllPending = { onClearAllPending() })
                 } else {
                     when (tab) {
                         Tab.Ledger -> LedgerScreen(state, onImportScreenshot, onPendingReview = { showPendingReview = true }, onEdit = { editingTransaction = it }, onDelete = onDeleteTransaction, onDeleteBatch = onDeleteTransactions)
                         Tab.Entry -> EntryScreen(state, onAddManual, manualVoucherCount = manualVoucherCount, onPickManualVoucher = onPickManualVoucher, onClearManualVoucher = onClearManualVoucher)
-                        Tab.Report -> ReportScreen(state)
+                        Tab.Report -> ReportScreen(
+                            report = report,
+                            categories = state.categories,
+                            onPeriod = onReportPeriod,
+                            onType = onReportType,
+                            onShift = onReportShift,
+                            onCustomRange = onReportCustomRange,
+                            onDrill = onReportDrill,
+                            onSaveBudget = onSaveBudget,
+                        )
                         Tab.Settings -> SettingsScreen(
                             state = state,
                             notificationAutoBookEnabled = notificationAutoBookEnabled,
@@ -432,6 +453,8 @@ fun AutoBookApp(
                             onToggleHideFromRecents = onToggleHideFromRecents,
                             autoDeleteScreenshot = autoDeleteScreenshot,
                             onToggleAutoDeleteScreenshot = onToggleAutoDeleteScreenshot,
+                            monthStartDay = monthStartDay,
+                            onMonthStartDayChange = onMonthStartDayChange,
                             onNotification = onOpenNotificationSettings,
                             onAppNotification = onOpenAppNotificationSettings,
                             onAccessibility = onOpenAccessibilitySettings,
@@ -447,10 +470,6 @@ fun AutoBookApp(
                             onExportBackup = onExportBackup,
                             onImportBackupClick = onImportBackupClick,
                             onShowLogs = { showLogs = true; loadLogs() },
-                            onSyncPush = onSyncPush,
-                            onSyncPull = onSyncPull,
-                            onSyncConfig = onSyncConfig,
-                            syncConfig = syncConfig,
                             onRequestAiForAccessibility = onRequestAiForAccessibility,
                             onShowAiRequiredDialog = { showAiRequiredDialog = true },
                             onAddNotificationRule = onAddNotificationRule,
@@ -481,7 +500,11 @@ fun AutoBookApp(
                 onDeleteTransaction(tx.id)
                 editingTransaction = null
             },
-            onRemoveVoucher = { idx -> onRemoveVoucher(tx.id, idx) }
+            onRemoveVoucher = { idx -> onRemoveVoucher(tx.id, idx) },
+            onSaveWithFlags = { merchant, amount, category, type, paidAt, note, paymentApp, exStats, exBudget ->
+                onUpdateTransactionFull(tx.id, merchant, amount, category, type, paidAt, note, paymentApp, exStats, exBudget)
+                editingTransaction = null
+            }
         )
     }
 
@@ -781,8 +804,10 @@ private fun MetricBox(label: String, value: String, modifier: Modifier = Modifie
 
 @Composable
 private fun DateHeader(date: String, txs: List<TransactionEntity>) {
-    val expense = txs.filter { it.type == TransactionType.EXPENSE }.sumOf { it.amountCents }
-    val income = txs.filter { it.type == TransactionType.INCOME }.sumOf { it.amountCents }
+    // 日汇总也排除「不计入收支」的账单，跟报表口径一致
+    val counted = txs.filterNot { it.excludeFromStats }
+    val expense = counted.filter { it.type == TransactionType.EXPENSE }.sumOf { it.amountCents }
+    val income = counted.filter { it.type == TransactionType.INCOME }.sumOf { it.amountCents }
     Row(Modifier.fillMaxWidth().padding(top = 4.dp), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
         Text("$date ${if (date == formatDate(System.currentTimeMillis())) "今天" else ""}", color = Ink, fontWeight = FontWeight.Bold)
         Text("支${formatMoney(expense)} 收${formatMoney(income)}", color = Muted, style = MaterialTheme.typography.bodySmall)
@@ -890,6 +915,17 @@ private fun TransactionRow(
                             fontWeight = FontWeight.SemiBold,
                             modifier = Modifier.background(Green.copy(alpha = 0.1f), RoundedCornerShape(4.dp)).padding(horizontal = 4.dp, vertical = 1.dp)
                         )
+                        // 不计入收支的账单打橙色标记，避免用户困惑为何统计里没有它
+                        if (tx.excludeFromStats) {
+                            Spacer(Modifier.width(4.dp))
+                            Text(
+                                "不计收支",
+                                color = Orange,
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.background(Orange.copy(alpha = 0.12f), RoundedCornerShape(4.dp)).padding(horizontal = 4.dp, vertical = 1.dp)
+                            )
+                        }
                     }
                     // 第二行：商户名称
                     Text(
@@ -1288,53 +1324,7 @@ private fun String.toBigDecimalOrNull(): BigDecimal? = try {
 }
 
 @Composable
-private fun ReportScreen(state: AutoBookUiState) {
-    var range by remember { mutableStateOf(ReportRange.Month) }
-    var type by remember { mutableStateOf(TransactionType.EXPENSE) }
-    val data = state.transactions.filter { it.type == type }
-    val series = valuesForRange(data, range)
-    val topCategory = data.groupBy { it.categoryId }.maxByOrNull { it.value.sumOf { tx -> tx.amountCents } }?.let { entry ->
-        state.categories.firstOrNull { it.id == entry.key }?.name ?: "其他"
-    } ?: "暂无"
-    LazyColumn(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        item { ReportTabs(range, onRange = { range = it }, type, onType = { type = it }) }
-        item {
-            Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFFDFEFF)), shape = RoundedCornerShape(18.dp)) {
-                Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
-                    Text("${range.label}概览", color = Ink, fontWeight = FontWeight.Bold)
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        MetricBlock("本期${type.label}", formatMoney(series.values.sum()), Modifier.weight(1f))
-                        MetricBlock("最大分类", topCategory, Modifier.weight(1f))
-                    }
-                }
-            }
-        }
-        item { ChartCard("${range.label}趋势") { LineChart(series, if (type == TransactionType.INCOME) FreshMint else FreshBlue) } }
-        item { ChartCard("${type.label}柱状") { BarChart(series, if (type == TransactionType.INCOME) FreshMint else FreshCoral) } }
-        item { CategoryPieCard(state, type) }
-        if (data.isEmpty()) item { EmptyHint("有${type.label}记录后，这里会显示趋势和分类构成。") }
-    }
-}
-
-@Composable
-private fun ReportTabs(range: ReportRange, onRange: (ReportRange) -> Unit, type: TransactionType, onType: (TransactionType) -> Unit) {
-    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-        Row(Modifier.fillMaxWidth().background(CardWhite, RoundedCornerShape(14.dp)).padding(4.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-            ReportRange.entries.forEach { item ->
-                SegmentButton(item.label, selected = item == range, modifier = Modifier.weight(1f)) { onRange(item) }
-            }
-        }
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-            Row(Modifier.background(CardWhite, RoundedCornerShape(18.dp)).padding(4.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                SegmentButton("支出", selected = type == TransactionType.EXPENSE) { onType(TransactionType.EXPENSE) }
-                SegmentButton("收入", selected = type == TransactionType.INCOME) { onType(TransactionType.INCOME) }
-            }
-        }
-    }
-}
-
-@Composable
-private fun SegmentButton(text: String, selected: Boolean, modifier: Modifier = Modifier, onClick: () -> Unit) {
+internal fun SegmentButton(text: String, selected: Boolean, modifier: Modifier = Modifier, onClick: () -> Unit) {
     Text(
         text,
         color = if (selected) Ink else Muted,
@@ -1343,115 +1333,48 @@ private fun SegmentButton(text: String, selected: Boolean, modifier: Modifier = 
     )
 }
 
+/** 月度周期起始日选择：1-28，1 表示自然月 */
 @Composable
-private fun MetricBlock(label: String, value: String, modifier: Modifier = Modifier) {
-    Column(modifier) {
-        Text(label, color = Muted, style = MaterialTheme.typography.bodySmall)
-        Text(value, color = Ink, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleLarge)
-    }
-}
-
-@Composable
-private fun ChartCard(title: String, chart: @Composable () -> Unit) {
-    Card(colors = CardDefaults.cardColors(containerColor = CardWhite), shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text(title, color = Ink, fontWeight = FontWeight.Bold)
-            chart()
-        }
-    }
-}
-
-@Composable
-private fun LineChart(series: ChartSeries, color: Color) {
-    val values = series.values
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-    Canvas(Modifier.fillMaxWidth().height(170.dp)) {
-        val maxValue = max(1L, values.maxOrNull() ?: 0L).toFloat()
-        if (values.all { it == 0L }) {
-            drawLine(Line, Offset(0f, size.height * 0.62f), Offset(size.width, size.height * 0.62f), strokeWidth = 2.dp.toPx(), cap = StrokeCap.Round)
-            return@Canvas
-        }
-        val stepX = size.width / max(1, values.size - 1)
-        repeat(4) { i ->
-            val y = size.height * i / 4f
-            drawLine(Line, Offset(0f, y), Offset(size.width, y), strokeWidth = 1.dp.toPx())
-        }
-        values.zipWithNext().forEachIndexed { index, (a, b) ->
-            val p1 = Offset(index * stepX, size.height - (a / maxValue) * size.height)
-            val p2 = Offset((index + 1) * stepX, size.height - (b / maxValue) * size.height)
-            drawLine(color, p1, p2, strokeWidth = 3.dp.toPx(), cap = StrokeCap.Round)
-        }
-        values.forEachIndexed { index, value ->
-            drawCircle(color, 4.dp.toPx(), Offset(index * stepX, size.height - (value / maxValue) * size.height))
-        }
-    }
-        ChartLabels(series.labels)
-    }
-}
-
-@Composable
-private fun BarChart(series: ChartSeries, color: Color) {
-    val values = series.values
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-    Canvas(Modifier.fillMaxWidth().height(170.dp)) {
-        val maxValue = max(1L, values.maxOrNull() ?: 0L).toFloat()
-        val gap = 8.dp.toPx()
-        val barWidth = (size.width - gap * (values.size + 1)) / max(1, values.size)
-        values.forEachIndexed { index, value ->
-            val height = max(4f, (value / maxValue) * size.height)
-            val left = gap + index * (barWidth + gap)
-            drawRoundRect(color.copy(alpha = 0.72f), Offset(left, size.height - height), Size(barWidth, height), cornerRadius = androidx.compose.ui.geometry.CornerRadius(8.dp.toPx(), 8.dp.toPx()))
-        }
-    }
-        ChartLabels(series.labels)
-    }
-}
-
-@Composable
-private fun ChartLabels(labels: List<String>) {
-    if (labels.isEmpty()) return
-    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-        labels.forEach { label -> Text(label, color = Muted, style = MaterialTheme.typography.labelSmall, maxLines = 1) }
-    }
-}
-
-@Composable
-private fun CategoryPieCard(state: AutoBookUiState, type: TransactionType) {
-    val grouped = state.transactions.filter { it.type == type }.groupBy { it.categoryId }.mapValues { it.value.sumOf { tx -> tx.amountCents } }.toList().sortedByDescending { it.second }
-    val total = grouped.sumOf { it.second }.coerceAtLeast(1L)
-    ChartCard("${type.label}分类构成") {
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-            DonutChart(grouped.map { it.second }, grouped.indices.map { FreshPalette[it % FreshPalette.size] }, Modifier.size(150.dp))
-            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                grouped.take(5).forEachIndexed { index, (categoryId, categoryTotal) ->
-                    val category = state.categories.firstOrNull { it.id == categoryId }
-                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                        Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
-                            Box(Modifier.size(8.dp).background(FreshPalette[index % FreshPalette.size], CircleShape))
-                            Spacer(Modifier.width(8.dp))
-                            Text("${category?.name ?: "其他"} ${(categoryTotal * 100 / total).coerceAtMost(100)}%", color = Ink, maxLines = 1, overflow = TextOverflow.Ellipsis)
+private fun MonthStartDayDialog(current: Int, onDismiss: () -> Unit, onConfirm: (Int) -> Unit) {
+    var selected by remember { mutableStateOf(current.coerceIn(1, 28)) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("月度周期起始日") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    if (selected == 1) "当前：自然月（1 日 - 月末）"
+                    else "当前：每月 $selected 日 至 次月 ${selected - 1} 日",
+                    color = Ink,
+                    fontWeight = FontWeight.Bold
+                )
+                Text("按工资日设置，可让「本月支出」和月预算跟真实现金流对齐。仅支持 1-28 日，避免 2 月缺日。", color = Muted, style = MaterialTheme.typography.bodySmall)
+                LazyVerticalGrid(
+                    columns = GridCells.Fixed(7),
+                    modifier = Modifier.height(190.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    items((1..28).toList()) { day ->
+                        val isSel = day == selected
+                        Box(
+                            Modifier
+                                .aspectRatio(1f)
+                                .background(if (isSel) Blue else Color(0xFFF2F5F9), RoundedCornerShape(8.dp))
+                                .clickable { selected = day },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text("$day", color = if (isSel) Color.White else Ink, style = MaterialTheme.typography.bodySmall)
                         }
-                        Text(formatMoney(categoryTotal), color = Muted)
                     }
                 }
-                if (grouped.isEmpty()) Text("暂无${type.label}数据", color = Muted)
             }
-        }
-    }
-}
-
-@Composable
-private fun DonutChart(values: List<Long>, colors: List<Color>, modifier: Modifier = Modifier) {
-    Canvas(modifier.aspectRatio(1f)) {
-        val total = values.sum().takeIf { it > 0 } ?: 1L
-        var start = -90f
-        values.forEachIndexed { index, value ->
-            val sweep = value.toFloat() / total * 360f
-            drawArc(colors.getOrElse(index) { Blue }, start, sweep, false, style = Stroke(width = 26.dp.toPx(), cap = StrokeCap.Butt))
-            start += sweep
-        }
-        if (values.isEmpty()) drawCircle(Line, radius = size.minDimension / 2.6f, style = Stroke(width = 26.dp.toPx()))
-    }
+        },
+        confirmButton = {
+            Button(onClick = { onConfirm(selected) }, colors = ButtonDefaults.buttonColors(containerColor = Blue)) { Text("保存") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } }
+    )
 }
 
 @OptIn(ExperimentalFoundationApi::class)
@@ -1464,6 +1387,8 @@ private fun SettingsScreen(
     onToggleHideFromRecents: (Boolean) -> Unit = {},
     autoDeleteScreenshot: Boolean = false,
     onToggleAutoDeleteScreenshot: (Boolean) -> Unit = {},
+    monthStartDay: Int = 1,
+    onMonthStartDayChange: (Int) -> Unit = {},
     onNotification: () -> Unit,
     onAppNotification: () -> Unit,
     onAccessibility: () -> Unit,
@@ -1477,10 +1402,6 @@ private fun SettingsScreen(
     onExportBackup: () -> Unit = {},
     onImportBackupClick: () -> Unit = {},
     onShowLogs: () -> Unit = {},
-    onSyncPush: (String, String) -> Unit = { _, _ -> },
-    onSyncPull: (String, String) -> Unit = { _, _ -> },
-    onSyncConfig: (String, String) -> Unit = { _, _ -> },
-    syncConfig: Pair<String, String> = Pair("", ""),
     onShowWhitelistManager: () -> Unit = {},
     onShowAiPromptEditor: () -> Unit = {},
     onRequestAiForAccessibility: () -> Unit,
@@ -1571,6 +1492,25 @@ private fun SettingsScreen(
         item { SettingCard("系统横幅通知", "用于显示自动记账成功后的顶部弹窗；HyperOS 中请允许悬浮/横幅通知", Icons.Default.Notifications, onAppNotification) }
         item { SettingCard("无障碍辅助", "${if (accessibilityEnabled) "已开启" else "未开启"} · 当前版本不主动自动记账（仅保留服务）", Icons.Default.Accessibility, if (state.aiSettings.configured) onAccessibility else onShowAiRequiredDialog) }
         item { SectionTitle("账本") }
+        // 月度周期起始日：按工资日算「本月」，影响统计、预算和报表
+        item {
+            var showPicker by remember { mutableStateOf(false) }
+            SettingCard(
+                "月度周期起始日",
+                if (monthStartDay == 1) "每月 1 日（自然月）· 影响统计、预算和报表" else "每月 $monthStartDay 日 至 次月 ${monthStartDay - 1} 日 · 影响统计、预算和报表",
+                Icons.Default.CalendarToday
+            ) { showPicker = true }
+            if (showPicker) {
+                MonthStartDayDialog(
+                    current = monthStartDay,
+                    onDismiss = { showPicker = false },
+                    onConfirm = {
+                        onMonthStartDayChange(it)
+                        showPicker = false
+                    }
+                )
+            }
+        }
         item { SettingCard("分类管理", "新增、重命名、换色或删除消费分类", Icons.Default.Category, onOpenCategoryManager) }
         item { SettingCard("导入账单", "选择微信、支付宝、京东、淘宝、抖音等 CSV/TXT/XLSX 账单", Icons.Default.FileUpload, onImportBills) }
         item { SettingCard("导出 CSV", "生成本地账本文件，并通过系统分享面板保存或发送", Icons.Default.FileDownload, onExportCsv) }
@@ -1585,8 +1525,6 @@ private fun SettingsScreen(
         item { SettingCard("导入数据", "从JSON备份文件恢复账单数据", Icons.Default.FileUpload, onImportBackupClick) }
         item { SettingCard("操作日志", "查看自动记账和系统操作记录", Icons.Default.ReceiptLong, onShowLogs) }
         item { SettingCard("使用说明", "了解 AI 模式和本地模式的使用方式", Icons.Default.MoreHoriz, onShowUsageGuide) }
-        item { SectionTitle("云同步") }
-        item { SyncSettingsCard(syncConfig, onSyncConfig, onSyncPush, onSyncPull) }
         item { SectionTitle("关于") }
         item {
             val about = state.aboutInfo
@@ -1757,12 +1695,18 @@ private fun AiSettingsDialog(
 }
 
 @Composable
-private fun CategoryManagerScreen(state: AutoBookUiState, onSave: (CategoryEntity?, String, TransactionType, Long, String, String?) -> Unit, onDelete: (CategoryEntity) -> Unit) {
+private fun CategoryManagerScreen(
+    state: AutoBookUiState,
+    onSave: (CategoryEntity?, String, TransactionType, Long, String, String?) -> Unit,
+    onDelete: (CategoryEntity) -> Unit,
+    onMove: (CategoryEntity, Boolean) -> Unit = { _, _ -> }
+) {
     var editing by remember { mutableStateOf<CategoryEntity?>(null) }
     var addingType by remember { mutableStateOf<TransactionType?>(null) }
     var addingSubTo by remember { mutableStateOf<CategoryEntity?>(null) }
     var expandedTopId by remember { mutableStateOf<String?>(null) }
     LazyColumn(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        item { EmptyHint("用 ↑ ↓ 调整分类顺序，顺序会影响记一笔和编辑账单里的分类排列。") }
         TransactionType.entries.forEach { type ->
             item {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
@@ -1771,7 +1715,7 @@ private fun CategoryManagerScreen(state: AutoBookUiState, onSave: (CategoryEntit
                 }
             }
             val topCategories = state.categories.filter { it.type == type && it.parentId == null }
-            items(topCategories, key = { it.id }) { category ->
+            itemsIndexed(topCategories, key = { _, item -> item.id }) { index, category ->
                 val subcategories = state.categories.filter { it.parentId == category.id }
                 val isExpanded = expandedTopId == category.id
                 Column {
@@ -1784,11 +1728,15 @@ private fun CategoryManagerScreen(state: AutoBookUiState, onSave: (CategoryEntit
                         } else null,
                         isExpanded = isExpanded,
                         subCount = subcategories.size,
-                        onAddSub = { addingSubTo = category }
+                        onAddSub = { addingSubTo = category },
+                        canMoveUp = index > 0,
+                        canMoveDown = index < topCategories.lastIndex,
+                        onMoveUp = { onMove(category, true) },
+                        onMoveDown = { onMove(category, false) }
                     )
                     if (isExpanded && subcategories.isNotEmpty()) {
-                        Column(Modifier.padding(start = 24.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                            subcategories.forEach { sub ->
+                        Column(Modifier.padding(start = 24.dp, top = 6.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            subcategories.forEachIndexed { subIndex, sub ->
                                 CategoryManageRow(
                                     sub,
                                     onEdit = { editing = sub },
@@ -1796,7 +1744,11 @@ private fun CategoryManagerScreen(state: AutoBookUiState, onSave: (CategoryEntit
                                     onExpand = null,
                                     isExpanded = false,
                                     subCount = 0,
-                                    onAddSub = null
+                                    onAddSub = null,
+                                    canMoveUp = subIndex > 0,
+                                    canMoveDown = subIndex < subcategories.lastIndex,
+                                    onMoveUp = { onMove(sub, true) },
+                                    onMoveDown = { onMove(sub, false) }
                                 )
                             }
                         }
@@ -1833,38 +1785,62 @@ private fun CategoryManageRow(
     onExpand: (() -> Unit)? = null,
     isExpanded: Boolean = false,
     subCount: Int = 0,
-    onAddSub: (() -> Unit)? = null
+    onAddSub: (() -> Unit)? = null,
+    canMoveUp: Boolean = false,
+    canMoveDown: Boolean = false,
+    onMoveUp: () -> Unit = {},
+    onMoveDown: () -> Unit = {}
 ) {
     Card(colors = CardDefaults.cardColors(containerColor = CardWhite), shape = RoundedCornerShape(12.dp)) {
-        Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-            Box(Modifier.size(42.dp).background(Color(category.color.toInt()).copy(alpha = 0.12f), RoundedCornerShape(12.dp)), contentAlignment = Alignment.Center) {
-                Icon(iconFor(category.icon), contentDescription = category.name, tint = Color(category.color.toInt()), modifier = Modifier.size(22.dp))
+        Row(Modifier.fillMaxWidth().padding(horizontal = 10.dp, vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+            // 排序：上移 / 下移
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Icon(
+                    Icons.Default.KeyboardArrowUp,
+                    contentDescription = "上移",
+                    tint = if (canMoveUp) Blue else Line,
+                    modifier = Modifier.size(22.dp).clickable(enabled = canMoveUp, onClick = onMoveUp)
+                )
+                Icon(
+                    Icons.Default.KeyboardArrowDown,
+                    contentDescription = "下移",
+                    tint = if (canMoveDown) Blue else Line,
+                    modifier = Modifier.size(22.dp).clickable(enabled = canMoveDown, onClick = onMoveDown)
+                )
             }
-            Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
-                Text(category.name, color = Ink, fontWeight = FontWeight.SemiBold)
+            Spacer(Modifier.width(6.dp))
+            Box(Modifier.size(38.dp).background(Color(category.color.toInt()).copy(alpha = 0.12f), RoundedCornerShape(12.dp)), contentAlignment = Alignment.Center) {
+                Icon(iconFor(category.icon), contentDescription = category.name, tint = Color(category.color.toInt()), modifier = Modifier.size(20.dp))
+            }
+            Column(Modifier.weight(1f).padding(horizontal = 10.dp)) {
+                Text(category.name, color = Ink, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 val subtitle = when {
                     category.parentId != null -> "子分类"
                     category.isDefault -> "默认分类"
                     else -> "自定义分类"
                 }
-                Text(subtitle, color = Muted, style = MaterialTheme.typography.bodySmall)
+                Text(subtitle, color = Muted, style = MaterialTheme.typography.labelSmall)
             }
             if (onAddSub != null) {
-                IconButton(onClick = onAddSub) { Icon(Icons.Default.Add, contentDescription = "添加子分类", tint = Blue, modifier = Modifier.size(20.dp)) }
+                IconButton(onClick = onAddSub, modifier = Modifier.size(32.dp)) { Icon(Icons.Default.Add, contentDescription = "添加子分类", tint = Blue, modifier = Modifier.size(18.dp)) }
             }
+            // 子分类数量与展开箭头并排，不要塞进同一个 IconButton 否则会重叠
             if (onExpand != null) {
-                IconButton(onClick = onExpand) {
-                    Text("$subCount", color = Muted, style = MaterialTheme.typography.bodySmall)
+                Row(
+                    Modifier.clickable(onClick = onExpand).padding(horizontal = 4.dp, vertical = 6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("$subCount", color = Muted, style = MaterialTheme.typography.labelSmall)
                     Icon(
-                        if (isExpanded) Icons.Default.ArrowBack else Icons.Default.ArrowForward,
+                        if (isExpanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
                         contentDescription = if (isExpanded) "收起" else "展开",
                         tint = Muted,
-                        modifier = Modifier.size(18.dp)
+                        modifier = Modifier.size(16.dp)
                     )
                 }
             }
-            IconButton(onClick = onEdit) { Icon(Icons.Default.Edit, contentDescription = "编辑") }
-            IconButton(onClick = onDelete) { Icon(Icons.Default.Delete, contentDescription = "删除", tint = Red) }
+            IconButton(onClick = onEdit, modifier = Modifier.size(32.dp)) { Icon(Icons.Default.Edit, contentDescription = "编辑", modifier = Modifier.size(18.dp)) }
+            IconButton(onClick = onDelete, modifier = Modifier.size(32.dp)) { Icon(Icons.Default.Delete, contentDescription = "删除", tint = Red, modifier = Modifier.size(18.dp)) }
         }
     }
 }
@@ -1940,7 +1916,9 @@ private fun TransactionEditDialog(
     onLoadVoucherPreview: () -> Unit,
     onClearVoucherPreview: () -> Unit,
     onDelete: () -> Unit,
-    onRemoveVoucher: (Int) -> Unit = {}
+    onRemoveVoucher: (Int) -> Unit = {},
+    /** 带「不计入收支/不计入预算」标记的保存回调 */
+    onSaveWithFlags: (String, String, String, TransactionType, Long, String, com.tao.autobook.data.PaymentApp, Boolean, Boolean) -> Unit
 ) {
     var type by remember(tx.id) { mutableStateOf(tx.type) }
     var merchant by remember(tx.id) { mutableStateOf(tx.merchantName) }
@@ -1948,6 +1926,8 @@ private fun TransactionEditDialog(
     var note by remember(tx.id) { mutableStateOf(tx.note) }
     var merchantInput by remember(tx.id) { mutableStateOf(tx.merchantName) }
     var editingTime by remember { mutableStateOf(false) }
+    var excludeStats by remember(tx.id) { mutableStateOf(tx.excludeFromStats) }
+    var excludeBudget by remember(tx.id) { mutableStateOf(tx.excludeFromBudget) }
     var editPaymentApp by remember(tx.id) { mutableStateOf(tx.paymentApp) }
     var paidAt by remember(tx.id) { mutableStateOf(tx.paidAt) }
     var showVoucherFull by remember { mutableStateOf(false) }
@@ -1982,6 +1962,27 @@ private fun TransactionEditDialog(
                 item { OutlinedTextField(value = note, onValueChange = { note = it }, label = { Text("备注") }, modifier = Modifier.fillMaxWidth(), singleLine = true) }
                 item {
                     InfoPill(formatDateTimeShort(paidAt), Icons.Default.CalendarToday, Modifier.fillMaxWidth().clickable { editingTime = true })
+                }
+                // 不计入收支 / 不计入预算：退款、提现、还款、内部转账用这个，避免污染统计
+                item {
+                    Card(colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF8F0)), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
+                        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                Column(Modifier.weight(1f)) {
+                                    Text("不计入收支", color = Ink, fontWeight = FontWeight.Bold)
+                                    Text("退款、提现、还款、内部转账勾这个，不进统计和报表", color = Muted, style = MaterialTheme.typography.labelSmall)
+                                }
+                                Switch(checked = excludeStats, onCheckedChange = { excludeStats = it })
+                            }
+                            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                                Column(Modifier.weight(1f)) {
+                                    Text("不计入预算", color = Ink)
+                                    Text("仍算收支，但不占预算额度（如大额一次性支出）", color = Muted, style = MaterialTheme.typography.labelSmall)
+                                }
+                                Switch(checked = excludeBudget, onCheckedChange = { excludeBudget = it }, enabled = !excludeStats)
+                            }
+                        }
+                    }
                 }
                 item {
                     Card(colors = CardDefaults.cardColors(containerColor = BlueSoft), shape = RoundedCornerShape(12.dp), modifier = Modifier.fillMaxWidth()) {
@@ -2048,7 +2049,18 @@ private fun TransactionEditDialog(
                 }
             }
         },
-        confirmButton = { Button(onClick = { onSave(merchant, amount, category, type, paidAt, note, editPaymentApp) }, colors = ButtonDefaults.buttonColors(containerColor = Blue)) { Text("保存") } },
+        confirmButton = {
+            Button(
+                onClick = {
+                    // exclude 标记随保存一起提交，避免两个异步写入竞争导致标记被 copy 覆盖
+                    onSaveWithFlags(
+                        merchant, amount, category, type, paidAt, note, editPaymentApp,
+                        excludeStats, if (excludeStats) false else excludeBudget
+                    )
+                },
+                colors = ButtonDefaults.buttonColors(containerColor = Blue)
+            ) { Text("保存") }
+        },
         dismissButton = {
             Row {
                 TextButton(onClick = onDelete) { Text("删除", color = Red) }
@@ -2283,29 +2295,6 @@ private fun paletteFor(type: TransactionType): List<Long> = when (type) {
     TransactionType.OTHER -> listOf(0xFFB879F2L, 0xFFA56DE2L, 0xFF9163D9L, 0xFF7F5DC7L, 0xFF5C6470L)
 }
 
-private fun valuesForRange(transactions: List<TransactionEntity>, range: ReportRange): ChartSeries {
-    val zone = ZoneId.systemDefault()
-    val today = LocalDate.now()
-    return when (range) {
-        ReportRange.Week -> (6 downTo 0).map { offset ->
-            val day = today.minusDays(offset.toLong())
-            day to transactions.filter { Instant.ofEpochMilli(it.paidAt).atZone(zone).toLocalDate() == day }.sumOf { it.amountCents }
-        }.let { rows -> ChartSeries(rows.map { it.second }, rows.map { it.first.format(DateTimeFormatter.ofPattern("MM-dd")) }) }
-        ReportRange.Month -> (29 downTo 0).map { offset ->
-            val day = today.minusDays(offset.toLong())
-            day to transactions.filter { Instant.ofEpochMilli(it.paidAt).atZone(zone).toLocalDate() == day }.sumOf { it.amountCents }
-        }.let { rows ->
-            val values = rows.map { it.second }
-            val labels = rows.mapIndexedNotNull { index, row -> if (index == 0 || index == 9 || index == 19 || index == rows.lastIndex) row.first.format(DateTimeFormatter.ofPattern("MM-dd")) else null }
-            ChartSeries(values, labels)
-        }
-        ReportRange.Year -> (11 downTo 0).map { offset ->
-            val month = today.minusMonths(offset.toLong()).withDayOfMonth(1)
-            month to transactions.filter { Instant.ofEpochMilli(it.paidAt).atZone(zone).toLocalDate().withDayOfMonth(1) == month }.sumOf { it.amountCents }
-        }.let { rows -> ChartSeries(rows.map { it.second }, rows.map { "${it.first.monthValue}月" }) }
-    }
-}
-
 private fun formatDateTimeShort(millis: Long): String = "${formatDate(millis)} ${formatTime(millis)}"
 
 private fun parseDateTimeInput(date: String, time: String): Long? = runCatching {
@@ -2464,94 +2453,6 @@ private fun AiPromptEditorScreen(
                 colors = ButtonDefaults.buttonColors(containerColor = Blue),
                 modifier = Modifier.weight(1f)
             ) { Text("保存") }
-        }
-    }
-}
-
-@Composable
-private fun SyncSettingsCard(
-    syncConfig: Pair<String, String>,
-    onSyncConfig: (String, String) -> Unit,
-    onSyncPush: (String, String) -> Unit,
-    onSyncPull: (String, String) -> Unit
-) {
-    var username by remember { mutableStateOf(syncConfig.first) }
-    var password by remember { mutableStateOf(syncConfig.second) }
-    var passwordVisible by remember { mutableStateOf(false) }
-    var feedback by remember { mutableStateOf("") }
-    // Display value: masked when hidden, real when visible
-    val displayPassword = if (passwordVisible) password else "\u2022".repeat(password.length)
-
-    Card(colors = CardDefaults.cardColors(containerColor = CardWhite), shape = RoundedCornerShape(14.dp), modifier = Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text("云同步", color = Ink, fontWeight = FontWeight.Bold)
-            Text("账号密码同步数据到服务器，多设备共享账单", color = Color(0xFF7D8792), style = MaterialTheme.typography.bodySmall)
-            if (feedback.isNotBlank()) {
-                Text(feedback, color = if (feedback.contains("失败") || feedback.contains("错误")) Red else Blue, style = MaterialTheme.typography.bodySmall)
-            }
-            OutlinedTextField(
-                value = username, onValueChange = { username = it },
-                label = { Text("账号") }, modifier = Modifier.fillMaxWidth(), singleLine = true
-            )
-            OutlinedTextField(
-                value = displayPassword,
-                onValueChange = { newVal ->
-                    if (passwordVisible) {
-                        password = newVal
-                    } else {
-                        // When masked, figure out what changed
-                        if (newVal.length > displayPassword.length) {
-                            // User typed a character
-                            password += newVal.last()
-                        } else if (newVal.length < displayPassword.length) {
-                            // User deleted a character
-                            password = password.dropLast(1)
-                        }
-                    }
-                },
-                label = { Text("密码") }, modifier = Modifier.fillMaxWidth(), singleLine = true,
-                trailingIcon = {
-                    Text(
-                        if (passwordVisible) "隐藏" else "显示",
-                        color = Blue,
-                        style = MaterialTheme.typography.labelSmall,
-                        modifier = Modifier.clickable { passwordVisible = !passwordVisible }.padding(8.dp)
-                    )
-                }
-            )
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                OutlinedButton(
-                    onClick = { onSyncConfig(username, password); feedback = "账号已保存" },
-                    shape = RoundedCornerShape(10.dp),
-                    modifier = Modifier.weight(1f)
-                ) { Text("保存账号") }
-                Button(
-                    onClick = {
-                        if (username.isBlank() || password.isBlank()) {
-                            feedback = "请先填写账号和密码"
-                        } else {
-                            feedback = "推送中..."
-                            onSyncPush(username, password)
-                        }
-                    },
-                    shape = RoundedCornerShape(10.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4C8DCE)),
-                    modifier = Modifier.weight(1f)
-                ) { Text("推送") }
-                Button(
-                    onClick = {
-                        if (username.isBlank() || password.isBlank()) {
-                            feedback = "请先填写账号和密码"
-                        } else {
-                            feedback = "拉取中..."
-                            onSyncPull(username, password)
-                        }
-                    },
-                    shape = RoundedCornerShape(10.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF10B981)),
-                    modifier = Modifier.weight(1f)
-                ) { Text("拉取") }
-            }
         }
     }
 }

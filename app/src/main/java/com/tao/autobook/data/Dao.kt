@@ -110,6 +110,22 @@ interface AutoBookDao {
     @Query("DELETE FROM categories WHERE id = :id")
     suspend fun deleteCategory(id: String)
 
+    @Query("UPDATE categories SET sortOrder = :sortOrder WHERE id = :id")
+    suspend fun updateCategorySortOrder(id: String, sortOrder: Int)
+
+    /** 交换两个分类的排序值，用于「上移/下移」 */
+    @Transaction
+    suspend fun swapCategoryOrder(idA: String, orderA: Int, idB: String, orderB: Int) {
+        updateCategorySortOrder(idA, orderB)
+        updateCategorySortOrder(idB, orderA)
+    }
+
+    /** 按给定顺序重排（规整化为 10,20,30…，修掉历史上重复的 sortOrder） */
+    @Transaction
+    suspend fun normalizeCategoryOrder(ids: List<String>) {
+        ids.forEachIndexed { index, id -> updateCategorySortOrder(id, (index + 1) * 10) }
+    }
+
     @Query("SELECT * FROM categories WHERE parentId = :parentId ORDER BY sortOrder")
     suspend fun getSubCategories(parentId: String): List<CategoryEntity>
 
@@ -186,24 +202,205 @@ interface AutoBookDao {
     suspend fun deleteLogsOlderThan(cutoff: Long)
 
     // CAST 成 REAL 再 SUM，避免 amountCents 异常/过大时 SQLite 整数 SUM 溢出直接抛 integer overflow
-    @Query("SELECT COALESCE(CAST(SUM(CAST(amountCents AS REAL)) AS INTEGER), 0) FROM transactions WHERE paidAt BETWEEN :start AND :end AND type = :type")
+    // 所有统计口径统一排除「不计入收支」的账单（excludeFromStats = 1）
+    @Query("SELECT COALESCE(CAST(SUM(CAST(amountCents AS REAL)) AS INTEGER), 0) FROM transactions WHERE paidAt BETWEEN :start AND :end AND type = :type AND excludeFromStats = 0")
     fun observeTotalBetween(start: Long, end: Long, type: TransactionType): Flow<Long>
 
-    @Query("SELECT COALESCE(CAST(SUM(CAST(amountCents AS REAL)) AS INTEGER), 0) FROM transactions WHERE paidAt >= :start AND type = 'EXPENSE'")
-    suspend fun getMonthExpense(start: Long): Long
+    @Query("SELECT COALESCE(CAST(SUM(CAST(amountCents AS REAL)) AS INTEGER), 0) FROM transactions WHERE paidAt BETWEEN :start AND :end AND type = 'EXPENSE' AND excludeFromStats = 0")
+    suspend fun getExpenseBetween(start: Long, end: Long): Long
 
-    @Query("SELECT COALESCE(CAST(SUM(CAST(amountCents AS REAL)) AS INTEGER), 0) FROM transactions WHERE paidAt >= :start AND type = 'INCOME'")
-    suspend fun getMonthIncome(start: Long): Long
-
-    @Query("SELECT COALESCE(CAST(SUM(CAST(amountCents AS REAL)) AS INTEGER), 0) FROM transactions WHERE paidAt >= :start AND type = 'EXPENSE'")
-    suspend fun getTodayExpense(start: Long): Long
-
-    @Query("SELECT COALESCE(CAST(SUM(CAST(amountCents AS REAL)) AS INTEGER), 0) FROM transactions WHERE paidAt >= :start AND type = 'INCOME'")
-    suspend fun getTodayIncome(start: Long): Long
+    @Query("SELECT COALESCE(CAST(SUM(CAST(amountCents AS REAL)) AS INTEGER), 0) FROM transactions WHERE paidAt BETWEEN :start AND :end AND type = 'INCOME' AND excludeFromStats = 0")
+    suspend fun getIncomeBetween(start: Long, end: Long): Long
 
     /** 清理离谱金额，防止启动统计 SUM 炸库 */
     @Query("UPDATE transactions SET amountCents = 0, updatedAt = :updatedAt WHERE amountCents < 0 OR amountCents > :maxCents")
     suspend fun sanitizeOutlierAmounts(maxCents: Long, updatedAt: Long): Int
+
+    /** 切换「不计入收支」/「不计入预算」标记 */
+    @Query("UPDATE transactions SET excludeFromStats = :excludeStats, excludeFromBudget = :excludeBudget, updatedAt = :updatedAt WHERE id = :id")
+    suspend fun updateExcludeFlags(id: Long, excludeStats: Boolean, excludeBudget: Boolean, updatedAt: Long)
+
+    // ====== 报表聚合（全部走 SQL，不受账本列表 500 条上限影响）======
+
+    /** 区间总览：合计、笔数、最大单笔、有账单天数 */
+    @Query(
+        """
+        SELECT COALESCE(CAST(SUM(CAST(amountCents AS REAL)) AS INTEGER), 0) AS total,
+               COUNT(*) AS cnt,
+               COALESCE(MAX(amountCents), 0) AS maxAmount,
+               COUNT(DISTINCT strftime('%Y-%m-%d', paidAt / 1000, 'unixepoch', 'localtime')) AS activeDays
+        FROM transactions
+        WHERE paidAt BETWEEN :start AND :end AND type = :type AND excludeFromStats = 0
+        """
+    )
+    suspend fun getRangeSummary(start: Long, end: Long, type: TransactionType): RangeSummaryRow
+
+    /** 预算口径合计：额外排除「不计入预算」的账单 */
+    @Query(
+        """
+        SELECT COALESCE(CAST(SUM(CAST(amountCents AS REAL)) AS INTEGER), 0)
+        FROM transactions
+        WHERE paidAt BETWEEN :start AND :end AND type = :type AND excludeFromStats = 0 AND excludeFromBudget = 0
+        """
+    )
+    suspend fun getBudgetSpent(start: Long, end: Long, type: TransactionType): Long
+
+    /** 预算口径按分类合计 */
+    @Query(
+        """
+        SELECT categoryId,
+               COALESCE(CAST(SUM(CAST(amountCents AS REAL)) AS INTEGER), 0) AS total,
+               COUNT(*) AS cnt
+        FROM transactions
+        WHERE paidAt BETWEEN :start AND :end AND type = :type AND excludeFromStats = 0 AND excludeFromBudget = 0
+        GROUP BY categoryId
+        """
+    )
+    suspend fun getBudgetCategoryTotals(start: Long, end: Long, type: TransactionType): List<CategoryTotalRow>
+
+    /** 区间内被标记「不计入收支」的合计与笔数，用于报表提示 */
+    @Query(
+        """
+        SELECT COALESCE(CAST(SUM(CAST(amountCents AS REAL)) AS INTEGER), 0) AS total,
+               COUNT(*) AS cnt,
+               COALESCE(MAX(amountCents), 0) AS maxAmount,
+               0 AS activeDays
+        FROM transactions
+        WHERE paidAt BETWEEN :start AND :end AND excludeFromStats = 1
+        """
+    )
+    suspend fun getExcludedSummary(start: Long, end: Long): RangeSummaryRow
+
+    /** 区间内按分类合计，倒序 */
+    @Query(
+        """
+        SELECT categoryId,
+               COALESCE(CAST(SUM(CAST(amountCents AS REAL)) AS INTEGER), 0) AS total,
+               COUNT(*) AS cnt
+        FROM transactions
+        WHERE paidAt BETWEEN :start AND :end AND type = :type AND excludeFromStats = 0
+        GROUP BY categoryId
+        ORDER BY total DESC
+        """
+    )
+    suspend fun getCategoryTotals(start: Long, end: Long, type: TransactionType): List<CategoryTotalRow>
+
+    /** 区间内按商家合计排行 */
+    @Query(
+        """
+        SELECT merchantName,
+               COALESCE(CAST(SUM(CAST(amountCents AS REAL)) AS INTEGER), 0) AS total,
+               COUNT(*) AS cnt
+        FROM transactions
+        WHERE paidAt BETWEEN :start AND :end AND type = :type AND excludeFromStats = 0 AND TRIM(merchantName) != ''
+        GROUP BY merchantName
+        ORDER BY total DESC
+        LIMIT :limit
+        """
+    )
+    suspend fun getMerchantTotals(start: Long, end: Long, type: TransactionType, limit: Int): List<MerchantTotalRow>
+
+    /** 区间内指定分类的商家排行（分类下钻） */
+    @Query(
+        """
+        SELECT merchantName,
+               COALESCE(CAST(SUM(CAST(amountCents AS REAL)) AS INTEGER), 0) AS total,
+               COUNT(*) AS cnt
+        FROM transactions
+        WHERE paidAt BETWEEN :start AND :end AND type = :type AND excludeFromStats = 0 AND categoryId = :categoryId AND TRIM(merchantName) != ''
+        GROUP BY merchantName
+        ORDER BY total DESC
+        LIMIT :limit
+        """
+    )
+    suspend fun getMerchantTotalsInCategory(start: Long, end: Long, type: TransactionType, categoryId: String, limit: Int): List<MerchantTotalRow>
+
+    /** 区间内按支付方式合计 */
+    @Query(
+        """
+        SELECT paymentApp,
+               COALESCE(CAST(SUM(CAST(amountCents AS REAL)) AS INTEGER), 0) AS total,
+               COUNT(*) AS cnt
+        FROM transactions
+        WHERE paidAt BETWEEN :start AND :end AND type = :type AND excludeFromStats = 0
+        GROUP BY paymentApp
+        ORDER BY total DESC
+        """
+    )
+    suspend fun getPaymentAppTotals(start: Long, end: Long, type: TransactionType): List<PaymentAppTotalRow>
+
+    /** 区间内按天合计 */
+    @Query(
+        """
+        SELECT strftime('%Y-%m-%d', paidAt / 1000, 'unixepoch', 'localtime') AS bucket,
+               COALESCE(CAST(SUM(CAST(amountCents AS REAL)) AS INTEGER), 0) AS total,
+               COUNT(*) AS cnt
+        FROM transactions
+        WHERE paidAt BETWEEN :start AND :end AND type = :type AND excludeFromStats = 0
+        GROUP BY bucket
+        ORDER BY bucket ASC
+        """
+    )
+    suspend fun getDayTotals(start: Long, end: Long, type: TransactionType): List<DayTotalRow>
+
+    /** 区间内按月合计 */
+    @Query(
+        """
+        SELECT strftime('%Y-%m', paidAt / 1000, 'unixepoch', 'localtime') AS bucket,
+               COALESCE(CAST(SUM(CAST(amountCents AS REAL)) AS INTEGER), 0) AS total,
+               COUNT(*) AS cnt
+        FROM transactions
+        WHERE paidAt BETWEEN :start AND :end AND type = :type AND excludeFromStats = 0
+        GROUP BY bucket
+        ORDER BY bucket ASC
+        """
+    )
+    suspend fun getMonthTotals(start: Long, end: Long, type: TransactionType): List<MonthTotalRow>
+
+    /** 区间内按星期合计（0=周日 … 6=周六） */
+    @Query(
+        """
+        SELECT CAST(strftime('%w', paidAt / 1000, 'unixepoch', 'localtime') AS INTEGER) AS weekday,
+               COALESCE(CAST(SUM(CAST(amountCents AS REAL)) AS INTEGER), 0) AS total,
+               COUNT(*) AS cnt
+        FROM transactions
+        WHERE paidAt BETWEEN :start AND :end AND type = :type AND excludeFromStats = 0
+        GROUP BY weekday
+        ORDER BY weekday ASC
+        """
+    )
+    suspend fun getWeekdayTotals(start: Long, end: Long, type: TransactionType): List<WeekdayTotalRow>
+
+    /** 区间 + 分类的账单明细（分类下钻列表） */
+    @Query(
+        """
+        SELECT * FROM transactions
+        WHERE paidAt BETWEEN :start AND :end AND type = :type AND excludeFromStats = 0 AND categoryId = :categoryId
+        ORDER BY amountCents DESC
+        LIMIT :limit
+        """
+    )
+    suspend fun getTransactionsInCategoryRange(start: Long, end: Long, type: TransactionType, categoryId: String, limit: Int): List<TransactionEntity>
+
+    /** 最早一笔账单时间，用于「全部」区间起点 */
+    @Query("SELECT MIN(paidAt) FROM transactions")
+    suspend fun getEarliestPaidAt(): Long?
+
+    // ====== 预算 ======
+    @Query("SELECT * FROM budgets")
+    fun observeBudgets(): Flow<List<BudgetEntity>>
+
+    @Query("SELECT * FROM budgets")
+    suspend fun getBudgets(): List<BudgetEntity>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun upsertBudget(budget: BudgetEntity)
+
+    @Query("DELETE FROM budgets WHERE categoryId = :categoryId")
+    suspend fun deleteBudget(categoryId: String)
+
+    @Query("DELETE FROM budgets")
+    suspend fun clearBudgets()
 
     @androidx.room.Query("SELECT * FROM transactions ORDER BY paidAt DESC")
     fun observeTransactionsPaged(): androidx.paging.PagingSource<Int, TransactionEntity>

@@ -92,7 +92,7 @@ data class CategoryEntity(
 
 @Entity(
     tableName = "transactions",
-    indices = [Index(value = ["dedupeKey"], unique = true), Index(value = ["paidAt"]), Index(value = ["categoryId"]), Index(value = ["type"])]
+    indices = [Index(value = ["dedupeKey"], unique = true), Index(value = ["paidAt"]), Index(value = ["categoryId"]), Index(value = ["type"]), Index(value = ["excludeFromStats"])]
 )
 data class TransactionEntity(
     @PrimaryKey(autoGenerate = true) val id: Long = 0,
@@ -109,7 +109,11 @@ data class TransactionEntity(
     val note: String = "",
     val createdAt: Long,
     val updatedAt: Long,
-    val type: TransactionType = TransactionType.EXPENSE
+    val type: TransactionType = TransactionType.EXPENSE,
+    /** 不计入收支：退款、提现、还款、内部转账等，不进任何统计与报表 */
+    val excludeFromStats: Boolean = false,
+    /** 不计入预算：仍进收支统计，但不占预算额度 */
+    val excludeFromBudget: Boolean = false
 ) {
     val amount: Double get() = amountCents / 100.0
 }
