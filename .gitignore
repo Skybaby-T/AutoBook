@@ -18,3 +18,6 @@ CHAT-LOG.md
 CHAT-LOG-FULL.md
 DEV-LOG.md
 *.log
+
+# 本机私有扩展（可选模块，不对外分发）
+app/src/main/java/com/tao/autobook/ext/

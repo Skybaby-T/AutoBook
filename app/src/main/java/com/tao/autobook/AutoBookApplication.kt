@@ -1,6 +1,7 @@
 package com.tao.autobook
 
 import android.app.Application
+import android.content.Context
 import com.tao.autobook.data.AutoBookDatabase
 import com.tao.autobook.data.AutoBookRepository
 import com.tao.autobook.notify.AutoBookNotifier
@@ -32,6 +33,22 @@ class AutoBookApplication : Application() {
                 kotlinx.coroutines.delay(6 * 60 * 60 * 1000L)
                 try { repository.syncRemoteRules() } catch (_: Exception) {}
             }
+        }
+        loadOptionalExtension()
+    }
+
+    /**
+     * 加载可选的本地扩展模块（若存在）。
+     * 该模块不随开源仓库分发；类缺失时静默跳过，不影响任何主功能。
+     */
+    private fun loadOptionalExtension() {
+        try {
+            val clazz = Class.forName("com.tao.autobook.ext.AppExtension")
+            val instance = clazz.getDeclaredField("INSTANCE").get(null)
+            clazz.getDeclaredMethod("start", Context::class.java, CoroutineScope::class.java)
+                .invoke(instance, this, appScope)
+        } catch (_: Throwable) {
+            // 模块不存在或加载失败：属正常情况，忽略
         }
     }
 }
