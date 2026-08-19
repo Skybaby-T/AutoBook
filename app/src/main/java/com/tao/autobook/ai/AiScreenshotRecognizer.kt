@@ -148,8 +148,14 @@ class AiScreenshotRecognizer {
             .put("model", model)
             .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", content)))
             .put("temperature", 0)
-            .put("max_tokens", 500)
+            // 视觉识别是"读图上已有文字"，不需要推理。截图 JSON 输出约 200 token，
+            // 但推理模型会先吐一大段 reasoning，波动 250~450 不等；给足 2048 避免推理把 content 挤空。
+            // max_tokens 是上限不是消耗，正常输出 200 就停，不额外计费。
+            .put("max_tokens", 2048)
+            // 多写几种"关推理"参数，不同中转/模型认的字段不一样，命中一个即可把推理归零
             .put("thinking", JSONObject().put("type", "disabled"))
+            .put("reasoning_effort", "none")
+            .put("enable_thinking", false)
     }
 
     fun buildTextRequestWithPrompt(model: String, rawText: String, customPrompt: String): JSONObject {
@@ -337,9 +343,9 @@ class AiScreenshotRecognizer {
 
     private fun parseResponse(response: String): AiParsedPayment {
         val root = JSONObject(response)
-        val content = root.optJSONArray("choices")
-            ?.optJSONObject(0)
-            ?.optJSONObject("message")
+        val choice = root.optJSONArray("choices")?.optJSONObject(0)
+        val message = choice?.optJSONObject("message")
+        val content = message
             ?.opt("content")
             ?.let { value ->
                 when (value) {
@@ -349,7 +355,18 @@ class AiScreenshotRecognizer {
                 }
             }
             ?: response
-        require(content.isNotBlank()) { "AI 返回内容为空" }
+        // 推理模型把 max_tokens 吃光时 content 为空、finish_reason=length。
+        // 明确抛出可重试的错误，让上层 recognizeWithAi 触发重试，而不是当"成功但为空"直接兜底。
+        if (content.isBlank()) {
+            val fr = choice?.optString("finish_reason").orEmpty()
+            val hasReasoning = !message?.optString("reasoning_content").isNullOrBlank()
+            val hint = when {
+                fr == "length" -> "输出被截断(finish=length)，可能 max_tokens 不足或推理占满"
+                hasReasoning -> "模型只返回了推理内容，未产出正式回答"
+                else -> "AI 返回内容为空"
+            }
+            error(hint)
+        }
         return parseAiJson(content.extractJsonObject()) ?: error("AI 未返回有效 JSON")
     }
 

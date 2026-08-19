@@ -417,6 +417,21 @@ interface AutoBookDao {
         if (missing.isNotEmpty()) upsertCategories(missing)
     }
 
+    @Query("UPDATE categories SET icon = :icon, color = :color WHERE id = :id AND isDefault = 1")
+    suspend fun updateCategoryAppearance(id: String, icon: String, color: Long)
+
+    /**
+     * 刷新内置分类的图标与配色。
+     * 只动 isDefault = 1 的内置分类，用户自定义分类和用户改过的分类名一律不碰。
+     * 老用户升级后也能拿到新图标/新色板，不用清数据。
+     */
+    @Transaction
+    suspend fun refreshBuiltInCategoryAppearance() {
+        BuiltInCategories.defaults.forEach { c ->
+            updateCategoryAppearance(c.id, c.icon, c.color)
+        }
+    }
+
     @Transaction
     suspend fun deleteCategoryAndMoveTransactions(categoryId: String, fallbackId: String) {
         moveTransactionsToCategory(categoryId, fallbackId, System.currentTimeMillis())

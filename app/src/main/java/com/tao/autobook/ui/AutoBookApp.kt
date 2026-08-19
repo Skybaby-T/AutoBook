@@ -3,6 +3,7 @@ package com.tao.autobook.ui
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -14,6 +15,7 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -71,6 +73,40 @@ import androidx.compose.material.icons.filled.ShoppingBag
 import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material.icons.filled.TaskAlt
 import androidx.compose.material.icons.filled.Wallet
+import androidx.compose.material.icons.filled.AccountBalance
+import androidx.compose.material.icons.filled.AssignmentReturn
+import androidx.compose.material.icons.filled.Bolt
+import androidx.compose.material.icons.filled.Checkroom
+import androidx.compose.material.icons.filled.ChildCare
+import androidx.compose.material.icons.filled.CleaningServices
+import androidx.compose.material.icons.filled.Cookie
+import androidx.compose.material.icons.filled.DeliveryDining
+import androidx.compose.material.icons.filled.Devices
+import androidx.compose.material.icons.filled.Dining
+import androidx.compose.material.icons.filled.DirectionsBus
+import androidx.compose.material.icons.filled.EvStation
+import androidx.compose.material.icons.filled.FitnessCenter
+import androidx.compose.material.icons.filled.Flight
+import androidx.compose.material.icons.filled.FreeBreakfast
+import androidx.compose.material.icons.filled.Handyman
+import androidx.compose.material.icons.filled.Home
+import androidx.compose.material.icons.filled.Hotel
+import androidx.compose.material.icons.filled.LocalBar
+import androidx.compose.material.icons.filled.LocalCafe
+import androidx.compose.material.icons.filled.LocalFireDepartment
+import androidx.compose.material.icons.filled.LocalGasStation
+import androidx.compose.material.icons.filled.LocalParking
+import androidx.compose.material.icons.filled.LocalTaxi
+import androidx.compose.material.icons.filled.MedicalServices
+import androidx.compose.material.icons.filled.Pets
+import androidx.compose.material.icons.filled.Redeem
+import androidx.compose.material.icons.filled.Spa
+import androidx.compose.material.icons.filled.SportsEsports
+import androidx.compose.material.icons.filled.Subway
+import androidx.compose.material.icons.filled.TrendingUp
+import androidx.compose.material.icons.filled.WaterDrop
+import androidx.compose.material.icons.filled.Wifi
+import androidx.compose.material.icons.filled.Work
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -111,6 +147,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
@@ -123,6 +161,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import com.tao.autobook.ai.AiRecognitionSettings
 import com.tao.autobook.data.BuiltInCategories
 import com.tao.autobook.data.CategoryEntity
@@ -596,6 +635,12 @@ private fun LedgerScreen(state: AutoBookUiState, onImportScreenshot: () -> Unit,
     var selectionMode by remember { mutableStateOf(false) }
     var typeFilter by remember { mutableStateOf<TransactionType?>(null) } // null=全部, EXPENSE=支出, INCOME=收入
     var searchQuery by remember { mutableStateOf("") }
+    // 月份筛选："" = 全部；否则形如 "2026-07"
+    var monthFilter by remember { mutableStateOf("") }
+    // 月历展开状态
+    var calendarExpanded by remember { mutableStateOf(false) }
+    // 选中的某一天："" = 未选具体天；否则 "2026-07-30"
+    var dayFilter by remember { mutableStateOf("") }
 
     fun enterSelection(id: Long) { selectionMode = true; selectedIds = setOf(id) }
     fun toggleSelect(id: Long) { selectedIds = if (id in selectedIds) selectedIds - id else selectedIds + id }
@@ -636,9 +681,20 @@ private fun LedgerScreen(state: AutoBookUiState, onImportScreenshot: () -> Unit,
     BackHandler(enabled = selectionMode) { exitSelection() }
 
     Box(Modifier.fillMaxSize()) {
+    // 月份桶：从全部账单按 yyyy-MM 聚合，倒序（最新月在前）
+    val monthKeyOf: (Long) -> String = { millis ->
+        Instant.ofEpochMilli(millis).atZone(ZoneId.systemDefault()).toLocalDate().let { "%04d-%02d".format(it.year, it.monthValue) }
+    }
+    val dayKeyOf: (Long) -> String = { millis -> formatDate(millis) } // yyyy-MM-dd
+    val monthBuckets = remember(state.transactions) {
+        state.transactions.groupBy { monthKeyOf(it.paidAt) }
+            .toSortedMap(compareByDescending { it })
+    }
     val filteredTxs = state.transactions
         .asSequence()
         .filter { typeFilter == null || it.type == typeFilter }
+        .filter { monthFilter.isBlank() || monthKeyOf(it.paidAt) == monthFilter }
+        .filter { dayFilter.isBlank() || dayKeyOf(it.paidAt) == dayFilter }
         .filter { matchesSearch(it, searchQuery) }
         .toList()
     val grouped = filteredTxs.groupBy { formatDate(it.paidAt) }
@@ -675,6 +731,36 @@ private fun LedgerScreen(state: AutoBookUiState, onImportScreenshot: () -> Unit,
             )
         }
         item { LedgerSummaryCard(state, typeFilter) { typeFilter = it } }
+        // 月份快捷筛选：单击=筛选该月，双击=展开月历
+        if (!selectionMode && monthBuckets.isNotEmpty()) {
+            item {
+                MonthFilterRow(
+                    monthBuckets = monthBuckets,
+                    selectedMonth = monthFilter,
+                    onSingleClick = { key ->
+                        if (monthFilter == key) { monthFilter = ""; calendarExpanded = false; dayFilter = "" }
+                        else { monthFilter = key; calendarExpanded = false; dayFilter = "" }
+                    },
+                    onDoubleClick = { key ->
+                        monthFilter = key
+                        dayFilter = ""
+                        calendarExpanded = !calendarExpanded || monthFilter != key
+                        calendarExpanded = true
+                    }
+                )
+            }
+            if (calendarExpanded && monthFilter.isNotBlank()) {
+                item {
+                    MonthCalendarCard(
+                        monthKey = monthFilter,
+                        txs = monthBuckets[monthFilter].orEmpty(),
+                        selectedDay = dayFilter,
+                        onSelectDay = { day -> dayFilter = if (dayFilter == day) "" else day },
+                        onClose = { calendarExpanded = false; dayFilter = "" }
+                    )
+                }
+            }
+        }
         if (!selectionMode) {
             item {
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
@@ -753,6 +839,199 @@ private fun LedgerScreen(state: AutoBookUiState, onImportScreenshot: () -> Unit,
             }
         }
     }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun MonthFilterRow(
+    monthBuckets: Map<String, List<TransactionEntity>>,
+    selectedMonth: String,
+    onSingleClick: (String) -> Unit,
+    onDoubleClick: (String) -> Unit
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Row(
+            Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            // 「全部」：单击/双击都回到全部
+            MonthChip(label = "全部", sub = null, count = null, selected = selectedMonth.isBlank(),
+                onSingle = { onSingleClick("") },
+                onDouble = { onSingleClick("") })
+            monthBuckets.forEach { (key, txs) ->
+                val monthNum = key.substringAfter("-").trimStart('0')
+                val expenseSum = txs.filterNot { it.excludeFromStats }.filter { it.type == TransactionType.EXPENSE }.sumOf { it.amountCents }
+                MonthChip(
+                    label = "${monthNum}月",
+                    sub = shortMoney(expenseSum),
+                    count = txs.size,
+                    selected = selectedMonth == key,
+                    onSingle = { onSingleClick(key) },
+                    onDouble = { onDoubleClick(key) }
+                )
+            }
+        }
+        Text("单击筛选该月 · 双击展开月历选某天", color = Line, style = MaterialTheme.typography.labelSmall)
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun MonthChip(
+    label: String,
+    sub: String?,
+    count: Int?,
+    selected: Boolean,
+    onSingle: () -> Unit,
+    onDouble: () -> Unit
+) {
+    Box {
+        Row(
+            Modifier
+                .background(
+                    if (selected) Brush.linearGradient(listOf(Color(0xFF8B6FD8), Color(0xFF6F8FE0))) else SolidColor(CardWhite),
+                    RoundedCornerShape(20.dp)
+                )
+                .combinedClickable(onClick = onSingle, onDoubleClick = onDouble)
+                .padding(horizontal = 15.dp, vertical = 7.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(label, color = if (selected) Color.White else Color(0xFF5A6270), fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.bodyMedium)
+            if (sub != null) {
+                Spacer(Modifier.width(4.dp))
+                Text(sub, color = if (selected) Color.White.copy(alpha = 0.75f) else Muted, style = MaterialTheme.typography.labelSmall)
+            }
+        }
+        if (count != null && count > 0) {
+            Box(
+                Modifier.align(Alignment.TopEnd).offset(x = 4.dp, y = (-4).dp)
+                    .background(Color.White, CircleShape)
+                    .padding(horizontal = 4.dp, vertical = 1.dp)
+            ) {
+                Text("$count", color = Blue, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.Bold)
+            }
+        }
+    }
+}
+
+@Composable
+private fun MonthCalendarCard(
+    monthKey: String,          // "2026-07"
+    txs: List<TransactionEntity>,
+    selectedDay: String,       // "2026-07-30" 或 ""
+    onSelectDay: (String) -> Unit,
+    onClose: () -> Unit
+) {
+    val year = monthKey.substringBefore("-").toInt()
+    val month = monthKey.substringAfter("-").toInt()
+    val firstDay = LocalDate.of(year, month, 1)
+    val daysInMonth = firstDay.lengthOfMonth()
+    // 周一=0 ... 周日=6，前面补空格
+    val leadingBlanks = (firstDay.dayOfWeek.value + 6) % 7
+
+    // 每天支出合计（分），排除不计收支
+    val dayExpense = remember(txs) {
+        txs.filterNot { it.excludeFromStats }
+            .filter { it.type == TransactionType.EXPENSE }
+            .groupBy { Instant.ofEpochMilli(it.paidAt).atZone(ZoneId.systemDefault()).toLocalDate().dayOfMonth }
+            .mapValues { it.value.sumOf { tx -> tx.amountCents } }
+    }
+    val maxDay = (dayExpense.values.maxOrNull() ?: 1L).coerceAtLeast(1L)
+    val monthExpenseSum = dayExpense.values.sum()
+
+    Card(colors = CardDefaults.cardColors(containerColor = CardWhite), shape = RoundedCornerShape(18.dp), modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Text("${year}年${month}月", color = Color(0xFF6B5CB0), fontWeight = FontWeight.Bold)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        if (selectedDay.isNotBlank()) "已选 $selectedDay" else "共${txs.size}笔 · 支${formatMoney(monthExpenseSum)}",
+                        color = Muted, style = MaterialTheme.typography.labelSmall
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    IconButton(onClick = onClose, modifier = Modifier.size(24.dp)) {
+                        Icon(Icons.Default.Close, contentDescription = "收起", tint = Muted, modifier = Modifier.size(16.dp))
+                    }
+                }
+            }
+            // 星期表头
+            Row(Modifier.fillMaxWidth()) {
+                listOf("一","二","三","四","五","六","日").forEach {
+                    Text(it, color = Line, style = MaterialTheme.typography.labelSmall, textAlign = androidx.compose.ui.text.style.TextAlign.Center, modifier = Modifier.weight(1f))
+                }
+            }
+            // 日期网格：7 列
+            val totalCells = leadingBlanks + daysInMonth
+            val rows = (totalCells + 6) / 7
+            for (r in 0 until rows) {
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                    for (c in 0 until 7) {
+                        val cellIndex = r * 7 + c
+                        val dayNum = cellIndex - leadingBlanks + 1
+                        if (dayNum in 1..daysInMonth) {
+                            val dayKey = "%04d-%02d-%02d".format(year, month, dayNum)
+                            val exp = dayExpense[dayNum] ?: 0L
+                            val level = when {
+                                exp <= 0L -> 0
+                                exp < maxDay * 0.25 -> 1
+                                exp < maxDay * 0.5 -> 2
+                                exp < maxDay * 0.8 -> 3
+                                else -> 4
+                            }
+                            CalendarCell(
+                                day = dayNum,
+                                expense = exp,
+                                level = level,
+                                selected = selectedDay == dayKey,
+                                modifier = Modifier.weight(1f),
+                                onClick = { onSelectDay(dayKey) }
+                            )
+                        } else {
+                            Spacer(Modifier.weight(1f))
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CalendarCell(day: Int, expense: Long, level: Int, selected: Boolean, modifier: Modifier = Modifier, onClick: () -> Unit) {
+    val bg = when (level) {
+        0 -> Color(0xFFF7F8FB)
+        1 -> Color(0x1A8B6FD8)
+        2 -> Color(0x388B6FD8)
+        3 -> Color(0x668B6FD8)
+        else -> Color(0xFF7E6BD8)
+    }
+    val textColor = if (level >= 3) Color.White else Color(0xFF454B57)
+    Box(
+        modifier
+            .aspectRatio(1f)
+            .background(bg, RoundedCornerShape(9.dp))
+            .then(if (selected) Modifier.border(2.dp, Blue, RoundedCornerShape(9.dp)) else Modifier)
+            .clickable(onClick = onClick),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Text("$day", color = textColor, style = MaterialTheme.typography.labelMedium, fontWeight = if (selected) FontWeight.Bold else FontWeight.Normal)
+            if (expense > 0L) {
+                Text(shortMoney(expense), color = textColor.copy(alpha = 0.7f), fontSize = 8.sp, maxLines = 1)
+            }
+        }
+    }
+}
+
+/** 金额缩略：分 → "1.2k" / "560" */
+private fun shortMoney(cents: Long): String {
+    val yuan = cents / 100.0
+    return when {
+        yuan >= 10000 -> "%.1fw".format(yuan / 10000)
+        yuan >= 1000 -> "%.1fk".format(yuan / 1000)
+        yuan >= 1 -> "%.0f".format(yuan)
+        else -> ""
     }
 }
 
@@ -2271,6 +2550,7 @@ private fun EmptyHint(text: String) {
 }
 
 private fun iconFor(name: String?): ImageVector = when (name) {
+    // 一级分类
     "Restaurant" -> Icons.Default.Restaurant
     "DirectionsCar" -> Icons.Default.DirectionsCar
     "ShoppingBag" -> Icons.Default.ShoppingBag
@@ -2286,6 +2566,46 @@ private fun iconFor(name: String?): ImageVector = when (name) {
     "CreditScore" -> Icons.Default.CreditScore
     "Wallet", "AddCard", "AccountBalanceWallet" -> Icons.Default.Wallet
     "MoreHoriz" -> Icons.Default.MoreHoriz
+    "AssignmentReturn" -> Icons.Default.AssignmentReturn
+    // 餐饮子分类
+    "FreeBreakfast" -> Icons.Default.FreeBreakfast
+    "Dining" -> Icons.Default.Dining
+    "DeliveryDining" -> Icons.Default.DeliveryDining
+    "Cookie" -> Icons.Default.Cookie
+    "Spa" -> Icons.Default.Spa
+    // 交通子分类
+    "DirectionsBus" -> Icons.Default.DirectionsBus
+    "LocalTaxi" -> Icons.Default.LocalTaxi
+    "Subway" -> Icons.Default.Subway
+    "LocalGasStation" -> Icons.Default.LocalGasStation
+    "LocalParking" -> Icons.Default.LocalParking
+    "EvStation" -> Icons.Default.EvStation
+    // 生活缴费子分类
+    "WaterDrop" -> Icons.Default.WaterDrop
+    "Bolt" -> Icons.Default.Bolt
+    "LocalFireDepartment" -> Icons.Default.LocalFireDepartment
+    "Home" -> Icons.Default.Home
+    "Wifi" -> Icons.Default.Wifi
+    // 娱乐子分类
+    "SportsEsports" -> Icons.Default.SportsEsports
+    "FitnessCenter" -> Icons.Default.FitnessCenter
+    // 购物子分类
+    "Checkroom" -> Icons.Default.Checkroom
+    "CleaningServices" -> Icons.Default.CleaningServices
+    "Devices" -> Icons.Default.Devices
+    // 常用备选（用户自定义分类时可选）
+    "Pets" -> Icons.Default.Pets
+    "Flight" -> Icons.Default.Flight
+    "Hotel" -> Icons.Default.Hotel
+    "LocalCafe" -> Icons.Default.LocalCafe
+    "LocalBar" -> Icons.Default.LocalBar
+    "ChildCare" -> Icons.Default.ChildCare
+    "Work" -> Icons.Default.Work
+    "Handyman" -> Icons.Default.Handyman
+    "MedicalServices" -> Icons.Default.MedicalServices
+    "Redeem" -> Icons.Default.Redeem
+    "TrendingUp" -> Icons.Default.TrendingUp
+    "AccountBalance" -> Icons.Default.AccountBalance
     else -> Icons.Default.Category
 }
 

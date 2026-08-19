@@ -68,6 +68,8 @@ class AutoBookRepository(
 
     suspend fun initialize() {
             dao.seedCategoriesIfEmpty()
+            // 内置分类图标/配色随版本刷新（不动用户自定义分类）
+            runCatching { dao.refreshBuiltInCategoryAppearance() }
             // 清理离谱金额（AI/导入误把元当分或超大数），避免启动统计 SUM integer overflow 闪退
             runCatching {
                 val fixed = dao.sanitizeOutlierAmounts(MAX_AMOUNT_CENTS, System.currentTimeMillis())
@@ -909,7 +911,9 @@ class AutoBookRepository(
                 localParsed
             }?.let { p ->
                 // 最终兜底：支付App / 时间 / 分类
-                val app = if (p.paymentApp == PaymentApp.UNKNOWN && appFromName != PaymentApp.UNKNOWN) appFromName else p.paymentApp
+                // 支付方式：截图来源包名是确定信息（从文件名解析），优先级高于 AI 从图内文字读到的付款渠道。
+                // 例：拼多多订单页写着"微信支付"，AI 会读成微信，但按 App 归类应记为拼多多。
+                val app = if (appFromName != PaymentApp.UNKNOWN) appFromName else p.paymentApp
                 val paidAt = if (p.paidAt <= 0) captureTime else p.paidAt
                 // 京东外卖/美团外卖等：OCR 含外卖关键词时，分类偏向餐饮
                 val categoryHint = when {
@@ -1148,7 +1152,20 @@ class AutoBookRepository(
     private suspend fun recognizeWithAi(bitmap: Bitmap, ocrText: String): Result<AiParsedPayment>? {
         val config = aiSettingsStore.loadConfig()
         if (!config.configured) return null
-        return aiRecognizer.recognize(bitmap, config, ocrText)
+        // 截图识别加重试：网络抖动 / 瞬时限流 / 推理模型偶发把 content 挤空时，重试大多能救回。
+        // 对齐通知识别路径的 3 次重试策略。
+        var lastResult: Result<AiParsedPayment>? = null
+        repeat(3) { attempt ->
+            val result = aiRecognizer.recognize(bitmap, config, ocrText)
+            if (result.isSuccess) return result
+            lastResult = result
+            val err = result.exceptionOrNull()?.message?.take(80) ?: "未知"
+            if (attempt < 2) {
+                addLog("截图补记", "AI识别失败(${attempt + 1}/3)，1.5秒后重试", err)
+                kotlinx.coroutines.delay(1500L)
+            }
+        }
+        return lastResult
     }
 
     private suspend fun recognizeWithAiRaw(bitmap: Bitmap): Result<AiParsedPayment>? {
