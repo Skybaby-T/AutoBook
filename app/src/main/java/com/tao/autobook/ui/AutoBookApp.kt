@@ -64,6 +64,7 @@ import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.Payments
 import androidx.compose.material.icons.filled.PhotoLibrary
 import androidx.compose.material.icons.filled.ReceiptLong
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Restaurant
 import androidx.compose.material.icons.filled.Savings
 import androidx.compose.material.icons.filled.School
@@ -300,7 +301,9 @@ fun AutoBookApp(
     /** 保存账单（含不计入收支/不计入预算标记） */
     onUpdateTransactionFull: (Long, String, String, String, TransactionType, Long, String, com.tao.autobook.data.PaymentApp, Boolean, Boolean) -> Unit = { _, _, _, _, _, _, _, _, _, _ -> },
     monthStartDay: Int = 1,
-    onMonthStartDayChange: (Int) -> Unit = {}
+    onMonthStartDayChange: (Int) -> Unit = {},
+    currentVersionCode: Int = 0,
+    onCheckUpdate: () -> Unit = {}
 ) {
     var tab by remember { mutableStateOf(Tab.Ledger) }
     var editingTransaction by remember { mutableStateOf<TransactionEntity?>(null) }
@@ -494,6 +497,8 @@ fun AutoBookApp(
                             onToggleAutoDeleteScreenshot = onToggleAutoDeleteScreenshot,
                             monthStartDay = monthStartDay,
                             onMonthStartDayChange = onMonthStartDayChange,
+                            currentVersionCode = currentVersionCode,
+                            onCheckUpdate = onCheckUpdate,
                             onNotification = onOpenNotificationSettings,
                             onAppNotification = onOpenAppNotificationSettings,
                             onAccessibility = onOpenAccessibilitySettings,
@@ -872,7 +877,7 @@ private fun MonthFilterRow(
                 )
             }
         }
-        Text("单击筛选该月 · 双击展开月历选某天", color = Line, style = MaterialTheme.typography.labelSmall)
+        Text("单击筛选该月 · 双击展开月历选某天", color = Muted, style = MaterialTheme.typography.labelSmall)
     }
 }
 
@@ -1033,6 +1038,54 @@ private fun shortMoney(cents: Long): String {
         yuan >= 1 -> "%.0f".format(yuan)
         else -> ""
     }
+}
+
+/** 版本更新弹窗 */
+@Composable
+internal fun UpdateDialog(
+    info: com.tao.autobook.data.AutoBookRepository.UpdateInfo,
+    onDownload: () -> Unit,
+    onLater: () -> Unit,
+    onNeverForVersion: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onLater,
+        title = {
+            Column {
+                Text("🚀 发现新版本", color = Ink, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleLarge)
+                Text(
+                    "v${info.versionName}" + if (info.fileSizeMb > 0) " · 约 ${info.fileSizeMb}MB" else "",
+                    color = Blue, style = MaterialTheme.typography.bodyMedium, modifier = Modifier.padding(top = 4.dp)
+                )
+            }
+        },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("更新内容", color = Muted, style = MaterialTheme.typography.labelMedium)
+                // changelog 支持用「；」或换行分条
+                val lines = info.changelog.split("；", ";", "\n").map { it.trim() }.filter { it.isNotBlank() }
+                if (lines.isEmpty()) {
+                    Text(info.changelog.ifBlank { "优化体验、修复问题" }, color = Ink, style = MaterialTheme.typography.bodyMedium)
+                } else {
+                    lines.forEach { line ->
+                        Row(verticalAlignment = Alignment.Top) {
+                            Text("· ", color = Color(0xFF8B6FD8), fontWeight = FontWeight.Bold)
+                            Text(line, color = Color(0xFF3A4048), style = MaterialTheme.typography.bodyMedium)
+                        }
+                    }
+                }
+                TextButton(onClick = onNeverForVersion, contentPadding = PaddingValues(0.dp)) {
+                    Text("不再提示此版本", color = Line, style = MaterialTheme.typography.labelSmall)
+                }
+            }
+        },
+        confirmButton = {
+            Button(onClick = onDownload, colors = ButtonDefaults.buttonColors(containerColor = Blue)) { Text("立即下载") }
+        },
+        dismissButton = {
+            TextButton(onClick = onLater) { Text("以后再说", color = Muted) }
+        }
+    )
 }
 
 @Composable
@@ -1668,6 +1721,8 @@ private fun SettingsScreen(
     onToggleAutoDeleteScreenshot: (Boolean) -> Unit = {},
     monthStartDay: Int = 1,
     onMonthStartDayChange: (Int) -> Unit = {},
+    currentVersionCode: Int = 0,
+    onCheckUpdate: () -> Unit = {},
     onNotification: () -> Unit,
     onAppNotification: () -> Unit,
     onAccessibility: () -> Unit,
@@ -1805,6 +1860,16 @@ private fun SettingsScreen(
         item { SettingCard("操作日志", "查看自动记账和系统操作记录", Icons.Default.ReceiptLong, onShowLogs) }
         item { SettingCard("使用说明", "了解 AI 模式和本地模式的使用方式", Icons.Default.MoreHoriz, onShowUsageGuide) }
         item { SectionTitle("关于") }
+        item {
+            val ctxVer = LocalContext.current
+            val verName = remember { try { ctxVer.packageManager.getPackageInfo(ctxVer.packageName, 0).versionName ?: "" } catch (_: Exception) { "" } }
+            SettingCard(
+                "检查更新",
+                if (verName.isNotBlank()) "当前版本 v$verName · 点击检查新版" else "点击检查新版",
+                Icons.Default.Refresh,
+                onCheckUpdate
+            )
+        }
         item {
             val about = state.aboutInfo
             val ctx = LocalContext.current

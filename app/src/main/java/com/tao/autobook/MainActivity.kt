@@ -27,6 +27,7 @@ import androidx.compose.runtime.setValue
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.tao.autobook.notify.AutoBookNotifier
 import com.tao.autobook.ui.AutoBookApp
+import com.tao.autobook.ui.UpdateDialog
 import com.tao.autobook.ui.AutoBookViewModel
 import com.tao.autobook.service.KeepAliveService
 import com.tao.autobook.ui.AutoBookViewModelFactory
@@ -97,6 +98,15 @@ class MainActivity : ComponentActivity() {
         val isChatSending by vm.isChatSending.collectAsState()
         val customKeywords by vm.customKeywords.collectAsState()
         val report by vm.report.collectAsState()
+        val updateInfo by vm.updateInfo.collectAsState()
+        // 本机 versionCode，启动自动检查更新（尊重「不再提示」）
+        val myVersionCode = remember {
+            runCatching {
+                val pi = packageManager.getPackageInfo(packageName, 0)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) pi.longVersionCode.toInt() else @Suppress("DEPRECATION") pi.versionCode
+            }.getOrDefault(0)
+        }
+        LaunchedEffect(Unit) { vm.checkUpdate(myVersionCode, manual = false) }
         var openTransactionId by remember { mutableStateOf(pendingTransactionId.value) }
         var notice by remember { mutableStateOf<com.tao.autobook.notify.AutoBookNotice?>(null) }
         val pickScreenshots = rememberLauncherForActivityResult(ActivityResultContracts.PickMultipleVisualMedia()) { uris ->
@@ -285,7 +295,24 @@ class MainActivity : ComponentActivity() {
                 vm.setMonthStartDay(it)
                 monthStartDay = it
             },
+            currentVersionCode = myVersionCode,
+            onCheckUpdate = { vm.checkUpdate(myVersionCode, manual = true) },
         )
+
+        // 更新提示弹窗
+        updateInfo?.let { info ->
+            UpdateDialog(
+                info = info,
+                onDownload = {
+                    // 优先取件页（可直接下载 APK），无取件码再退回官网
+                    val u = if (info.pickupCode.isNotBlank()) "https://taxi.ssssvip.cc.cd/?code=${info.pickupCode}" else info.website
+                    startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(u)))
+                    vm.dismissUpdateDialog()
+                },
+                onLater = { vm.dismissUpdateDialog() },
+                onNeverForVersion = { vm.dismissUpdateForever() }
+            )
+        }
 
 
 

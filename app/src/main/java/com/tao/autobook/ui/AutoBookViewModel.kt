@@ -74,6 +74,9 @@ class AutoBookViewModel(private val repository: AutoBookRepository) : ViewModel(
     /** 报表页状态：周期/类型/区间/聚合结果/预算/下钻 */
     private val reportState = MutableStateFlow(ReportUiState())
     val report: StateFlow<ReportUiState> = reportState
+    /** 更新提示：null 表示无更新或已忽略 */
+    private val updateInfoFlow = MutableStateFlow<com.tao.autobook.data.AutoBookRepository.UpdateInfo?>(null)
+    val updateInfo: StateFlow<com.tao.autobook.data.AutoBookRepository.UpdateInfo?> = updateInfoFlow
     val chatMessages: StateFlow<List<com.tao.autobook.data.ChatMessage>> = repository.observeChatMessages()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
     private val chatSending = MutableStateFlow(false)
@@ -289,6 +292,36 @@ class AutoBookViewModel(private val repository: AutoBookRepository) : ViewModel(
                 .onSuccess { message.value = "预算已清空" }
                 .onFailure { message.value = it.message ?: "预算清空失败" }
         }
+    }
+
+    // ====== 版本更新检查 ======
+    /**
+     * 检查更新。
+     * @param currentCode 本机 versionCode（由 UI 从 packageManager 读取传入）
+     * @param manual true=用户手动点「检查更新」（无更新也提示）；false=启动自动检查（静默 + 尊重「不再提示」）
+     */
+    fun checkUpdate(currentCode: Int, manual: Boolean) {
+        viewModelScope.launch {
+            val info = repository.checkUpdate(currentCode)
+            when {
+                info == null -> {
+                    if (manual) message.value = "当前已是最新版本"
+                }
+                !manual && repository.isUpdateDismissed(info.versionCode) -> {
+                    // 启动自动检查，且用户已对该版本点过「不再提示」→ 不弹
+                }
+                else -> updateInfoFlow.value = info
+            }
+        }
+    }
+
+    /** 关闭更新弹窗（以后再说） */
+    fun dismissUpdateDialog() { updateInfoFlow.value = null }
+
+    /** 不再提示此版本 */
+    fun dismissUpdateForever() {
+        updateInfoFlow.value?.let { repository.dismissUpdate(it.versionCode) }
+        updateInfoFlow.value = null
     }
 
     // ====== 不计入收支 / 不计入预算 ======

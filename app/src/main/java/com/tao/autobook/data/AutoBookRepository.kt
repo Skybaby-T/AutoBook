@@ -2121,6 +2121,59 @@ $chatHistory
     )
     data class Recommendation(val name: String = "", val url: String = "", val desc: String = "")
 
+    // ====== 版本更新检查 ======
+    /** version.json 的解析结果 */
+    data class UpdateInfo(
+        val versionName: String,
+        val versionCode: Int,
+        val changelog: String,
+        val pickupCode: String,
+        val apkUrl: String,
+        val fileSizeMb: Int,
+        val website: String,
+    )
+
+    /**
+     * 拉取 version.json 检查更新。返回 null 表示无更新 / 拉取失败 / 已是最新。
+     * @param currentCode 本机 versionCode
+     */
+    suspend fun checkUpdate(currentCode: Int): UpdateInfo? = withContext(Dispatchers.IO) {
+        try {
+            val url = java.net.URL("https://taxi.ssssvip.cc.cd/static/version.json")
+            val conn = url.openConnection() as java.net.HttpURLConnection
+            conn.connectTimeout = 8000
+            conn.readTimeout = 8000
+            val text = conn.inputStream.bufferedReader().readText()
+            conn.disconnect()
+            val json = org.json.JSONObject(text)
+            val code = json.optInt("versionCode", 0)
+            if (code <= currentCode) return@withContext null   // 已是最新
+            UpdateInfo(
+                versionName = json.optString("versionName", ""),
+                versionCode = code,
+                changelog = json.optString("changelog", ""),
+                pickupCode = json.optString("pickupCode", ""),
+                apkUrl = json.optString("apkUrl", ""),
+                fileSizeMb = json.optInt("fileSizeMb", 0),
+                website = json.optString("website", "https://taxi.ssssvip.cc.cd/autobook"),
+            )
+        } catch (e: Exception) {
+            android.util.Log.w("AutoBook", "checkUpdate failed: ${e.message}")
+            null
+        }
+    }
+
+    /** 记录某版本已点「不再提示」 */
+    fun isUpdateDismissed(versionCode: Int): Boolean {
+        val prefs = context.getSharedPreferences("autobook_settings", android.content.Context.MODE_PRIVATE)
+        return prefs.getInt("update_dismissed_code", 0) >= versionCode
+    }
+
+    fun dismissUpdate(versionCode: Int) {
+        context.getSharedPreferences("autobook_settings", android.content.Context.MODE_PRIVATE)
+            .edit().putInt("update_dismissed_code", versionCode).apply()
+    }
+
     suspend fun fetchAboutInfo(): AboutInfo = withContext(Dispatchers.IO) {
         try {
             val url = java.net.URL("https://taxi.ssssvip.cc.cd/static/about.json")
