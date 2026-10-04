@@ -24,12 +24,14 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.activity.compose.BackHandler
@@ -135,6 +137,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.rememberSwipeToDismissBoxState
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import android.content.Intent
 import android.net.Uri
 import androidx.compose.runtime.Composable
@@ -184,6 +187,7 @@ import java.time.YearMonth
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import kotlin.math.max
+import kotlin.math.roundToInt
 
 private val AppBackground = Color(0xFFF4F6FA)
 internal val CardWhite = Color(0xFFFFFFFF)
@@ -2483,17 +2487,31 @@ private fun DateTimeEditDialog(initialMillis: Long, onDismiss: () -> Unit, onSav
 
 @Composable
 private fun WheelPicker(values: List<Int>, selected: Int, onSelected: (Int) -> Unit, label: (Int) -> String, modifier: Modifier = Modifier) {
-    LazyColumn(modifier = modifier.height(154.dp).background(CardWhite, RoundedCornerShape(12.dp)), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        items(values) { value ->
+    val density = LocalDensity.current
+    val selectedIndex = values.indexOf(selected).coerceAtLeast(0)
+    // 打开时直接把当前值滚到视野中央，不用从第一项往下滑。
+    // 布局：Spacer(56) + 4间距 + 每行40（36行高+4间距）+ 4间距 + Spacer(56)
+    // 第 i 行中心 = 78 + 40i；视口 154dp 中心 77dp → 初始滚动 = 40i + 1（dp）
+    // 只在打开时定位一次（不 key selectedIndex），后续点击/滚动不重置位置
+    val initialScroll = with(density) { (selectedIndex * 40.dp.toPx() + 1.dp.toPx()).roundToInt() }
+    val scrollState = rememberScrollState(initial = initialScroll)
+    Column(
+        modifier = modifier.height(154.dp).background(CardWhite, RoundedCornerShape(12.dp)).verticalScroll(scrollState),
+        verticalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        Spacer(Modifier.height(56.dp))
+        values.forEach { value ->
             val active = value == selected
             Text(
                 label(value),
                 color = if (active) Blue else Muted,
                 fontWeight = if (active) FontWeight.Bold else FontWeight.Normal,
                 maxLines = 1,
+                textAlign = TextAlign.Center,
                 modifier = Modifier.fillMaxWidth().height(36.dp).background(if (active) BlueSoft else Color.Transparent, RoundedCornerShape(10.dp)).clickable { onSelected(value) }.padding(horizontal = 6.dp, vertical = 8.dp)
             )
         }
+        Spacer(Modifier.height(56.dp))
     }
 }
 
