@@ -49,6 +49,13 @@ class AiSettingsStore(
         }
     }
 
+    /** 只切换 AI 识别总开关，不动地址/模型/密钥（供设置页快捷开关使用） */
+    suspend fun setEnabled(enabled: Boolean) {
+        context.aiDataStore.edit { prefs ->
+            prefs[Keys.enabled] = enabled
+        }
+    }
+
     suspend fun loadConfig(): AiRecognitionConfig {
         val prefs = context.aiDataStore.data.first()
         val encryptedKey = prefs[Keys.encryptedApiKey].orEmpty()

@@ -307,7 +307,8 @@ fun AutoBookApp(
     monthStartDay: Int = 1,
     onMonthStartDayChange: (Int) -> Unit = {},
     currentVersionCode: Int = 0,
-    onCheckUpdate: () -> Unit = {}
+    onCheckUpdate: () -> Unit = {},
+    onToggleAi: (Boolean) -> Unit = {}
 ) {
     var tab by remember { mutableStateOf(Tab.Ledger) }
     var editingTransaction by remember { mutableStateOf<TransactionEntity?>(null) }
@@ -490,6 +491,9 @@ fun AutoBookApp(
                             onCustomRange = onReportCustomRange,
                             onDrill = onReportDrill,
                             onSaveBudget = onSaveBudget,
+                            onOpenTransaction = { id ->
+                                state.transactions.firstOrNull { it.id == id }?.let { editingTransaction = it }
+                            },
                         )
                         Tab.Settings -> SettingsScreen(
                             state = state,
@@ -502,8 +506,9 @@ fun AutoBookApp(
                             monthStartDay = monthStartDay,
                             onMonthStartDayChange = onMonthStartDayChange,
                             currentVersionCode = currentVersionCode,
-                            onCheckUpdate = onCheckUpdate,
-                            onNotification = onOpenNotificationSettings,
+                                                        onCheckUpdate = onCheckUpdate,
+                                                        onToggleAi = onToggleAi,
+                                                        onNotification = onOpenNotificationSettings,
                             onAppNotification = onOpenAppNotificationSettings,
                             onAccessibility = onOpenAccessibilitySettings,
                             onExportCsv = onExportCsv,
@@ -1727,6 +1732,7 @@ private fun SettingsScreen(
     onMonthStartDayChange: (Int) -> Unit = {},
     currentVersionCode: Int = 0,
     onCheckUpdate: () -> Unit = {},
+    onToggleAi: (Boolean) -> Unit = {},
     onNotification: () -> Unit,
     onAppNotification: () -> Unit,
     onAccessibility: () -> Unit,
@@ -1750,87 +1756,146 @@ private fun SettingsScreen(
     accessibilityEnabled: Boolean
 ) {
     LazyColumn(Modifier.fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-        item { SectionTitle("权限") }
-        item { SettingCard("通知监听权限", "${if (notificationEnabled) "系统已授权" else "系统未授权"} · 点此去系统设置开关通知使用权", Icons.Default.Notifications, onNotification) }
+        // ===== 顶部总览卡：一眼看清当前在用什么记账方式 =====
+        item {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = Color.Transparent),
+                shape = RoundedCornerShape(18.dp),
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Column(
+                    Modifier
+                        .fillMaxWidth()
+                        .background(
+                            Brush.linearGradient(listOf(Color(0xFF5B9BD5), Blue))
+                        )
+                        .padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(2.dp)
+                ) {
+                    Text(
+                        "当前记账方式",
+                        color = Color.White.copy(alpha = 0.92f),
+                        fontWeight = FontWeight.Bold,
+                        style = MaterialTheme.typography.labelMedium
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    OverviewRow("📸", "截图记账", "主路径", true)
+                    OverviewRow("🔔", "通知记账", if (notificationAutoBookEnabled) "已开启" else "未开启", notificationAutoBookEnabled)
+                    OverviewRow("🧠", "AI 智能识别", if (state.aiSettings.enabled) "已开启" else "未开启", state.aiSettings.enabled)
+                    OverviewRow("♿", "无障碍辅助", if (accessibilityEnabled) "已开启" else "未开启", accessibilityEnabled)
+                    Spacer(Modifier.height(8.dp))
+                    Box(Modifier.fillMaxWidth().height(1.dp).background(Color.White.copy(alpha = 0.22f)))
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        if (state.aiSettings.enabled)
+                            "截图 / 通知自动识别入账 · 识别引擎：AI 智能分析（失败自动回退本地规则）"
+                        else
+                            "截图 / 通知自动识别入账 · 识别引擎：本地规则（未开 AI）",
+                        color = Color.White.copy(alpha = 0.9f),
+                        style = MaterialTheme.typography.labelSmall
+                    )
+                }
+            }
+        }
+
+        // ===== 记账方式 =====
+        item { SectionTitle("记账方式") }
         item {
             Card(colors = CardDefaults.cardColors(containerColor = CardWhite), shape = RoundedCornerShape(14.dp), modifier = Modifier.fillMaxWidth()) {
-                Row(
-                    Modifier.fillMaxWidth().padding(14.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
+                Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text("📸", style = MaterialTheme.typography.titleMedium)
+                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text("截图记账", color = Ink, fontWeight = FontWeight.SemiBold)
+                        Text("常驻开启：截图后自动识别入账，主路径", color = Muted, style = MaterialTheme.typography.bodySmall)
+                    }
+                    Text("运行中", color = Green, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.labelMedium)
+                }
+            }
+        }
+        item {
+            Card(colors = CardDefaults.cardColors(containerColor = CardWhite), shape = RoundedCornerShape(14.dp), modifier = Modifier.fillMaxWidth()) {
+                Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                     Icon(Icons.Default.Notifications, contentDescription = null, tint = Blue)
                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Text("通知自动记账", color = Ink, fontWeight = FontWeight.SemiBold)
+                        Text("通知记账", color = Ink, fontWeight = FontWeight.SemiBold)
                         Text(
-                            if (notificationAutoBookEnabled) "开启：支付通知会自动记账"
-                            else "关闭：只靠截图记账，通知不入账",
-                            color = Muted,
-                            style = MaterialTheme.typography.bodySmall
+                            if (notificationAutoBookEnabled) "支付通知自动入账" else "关闭：只靠截图记账",
+                            color = Muted, style = MaterialTheme.typography.bodySmall
                         )
                         if (notificationAutoBookEnabled && !notificationEnabled) {
                             Text("系统通知使用权未开，开关开了也不会生效", color = Red, style = MaterialTheme.typography.labelSmall)
                         }
                     }
-                    Switch(
-                        checked = notificationAutoBookEnabled,
-                        onCheckedChange = onToggleNotificationAutoBook
-                    )
+                    Switch(checked = notificationAutoBookEnabled, onCheckedChange = onToggleNotificationAutoBook)
                 }
             }
         }
         item {
             Card(colors = CardDefaults.cardColors(containerColor = CardWhite), shape = RoundedCornerShape(14.dp), modifier = Modifier.fillMaxWidth()) {
-                Row(
-                    Modifier.fillMaxWidth().padding(14.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    Icon(Icons.Default.MoreHoriz, contentDescription = null, tint = Blue)
+                Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Icon(Icons.Default.Image, contentDescription = null, tint = Blue)
                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Text("最近任务中隐藏", color = Ink, fontWeight = FontWeight.SemiBold)
+                        Text("AI 智能识别", color = Ink, fontWeight = FontWeight.SemiBold)
                         Text(
-                            if (hideFromRecents) "开启：从多任务/最近任务列表隐藏本应用"
-                            else "关闭：在最近任务列表中显示本应用",
-                            color = Muted,
-                            style = MaterialTheme.typography.bodySmall
+                            if (state.aiSettings.enabled) {
+                                val m = state.aiSettings.model.ifBlank { "未选模型" }
+                                "已开启 · $m"
+                            } else "关闭：使用本地规则识别（不联网）",
+                            color = Muted, style = MaterialTheme.typography.bodySmall
                         )
+                        if (state.aiSettings.enabled && !state.aiSettings.configured) {
+                            Text("接口未配置完整，点击下方「AI 接口设置」补齐", color = Red, style = MaterialTheme.typography.labelSmall)
+                        }
                     }
-                    Switch(
-                        checked = hideFromRecents,
-                        onCheckedChange = onToggleHideFromRecents
-                    )
+                    Switch(checked = state.aiSettings.enabled, onCheckedChange = { onToggleAi(it) })
                 }
             }
         }
+        item { SettingCard("AI 接口设置", "${if (state.aiSettings.configured) "已配置" else "未配置"} · API 地址、模型、密钥", Icons.Default.Settings, onOpenAiSettings) }
         item {
             Card(colors = CardDefaults.cardColors(containerColor = CardWhite), shape = RoundedCornerShape(14.dp), modifier = Modifier.fillMaxWidth()) {
-                Row(
-                    Modifier.fillMaxWidth().padding(14.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(12.dp)
-                ) {
-                    Icon(Icons.Default.Delete, contentDescription = null, tint = Blue)
+                Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Icon(Icons.Default.Accessibility, contentDescription = null, tint = if (accessibilityEnabled) Blue else Muted)
                     Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Text("记账成功自动删除截图", color = Ink, fontWeight = FontWeight.SemiBold)
+                        Text("无障碍辅助", color = Ink, fontWeight = FontWeight.SemiBold)
                         Text(
-                            if (autoDeleteScreenshot) "开启：自动记账成功后自动删除相册原截图"
-                            else "关闭：保留相册截图",
-                            color = Muted,
-                            style = MaterialTheme.typography.bodySmall
+                            if (accessibilityEnabled) "已开启 · 读取支付页面内容辅助识别"
+                            else "未开启 · 需要时去系统设置开启",
+                            color = Muted, style = MaterialTheme.typography.bodySmall
                         )
                     }
-                    Switch(
-                        checked = autoDeleteScreenshot,
-                        onCheckedChange = onToggleAutoDeleteScreenshot
-                    )
+                    TextButton(onClick = { if (state.aiSettings.configured) onAccessibility() else onShowAiRequiredDialog() }) {
+                        Text(if (accessibilityEnabled) "管理" else "去开启", color = Blue)
+                    }
                 }
             }
         }
-        item { SettingCard("系统横幅通知", "用于显示自动记账成功后的顶部弹窗；HyperOS 中请允许悬浮/横幅通知", Icons.Default.Notifications, onAppNotification) }
-        item { SettingCard("无障碍辅助", "${if (accessibilityEnabled) "已开启" else "未开启"} · 当前版本不主动自动记账（仅保留服务）", Icons.Default.Accessibility, if (state.aiSettings.configured) onAccessibility else onShowAiRequiredDialog) }
+
+        // ===== 权限与后台 =====
+        item { SectionTitle("权限与后台") }
+        item {
+            Card(colors = CardDefaults.cardColors(containerColor = CardWhite), shape = RoundedCornerShape(14.dp), modifier = Modifier.fillMaxWidth()) {
+                Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Icon(Icons.Default.Notifications, contentDescription = null, tint = if (notificationEnabled) Green else Red)
+                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text("通知使用权", color = Ink, fontWeight = FontWeight.SemiBold)
+                        Text(if (notificationEnabled) "系统已授权" else "系统未授权 · 通知记账不可用", color = if (notificationEnabled) Muted else Red, style = MaterialTheme.typography.bodySmall)
+                    }
+                    TextButton(onClick = onNotification) { Text("系统设置", color = Blue) }
+                }
+            }
+        }
+        item { SettingCard("记账成功横幅提醒", "HyperOS 中请允许悬浮/横幅通知", Icons.Default.Notifications, onAppNotification) }
+
+        // ===== 识别规则 =====
+        item { SectionTitle("识别规则") }
+        item { SettingCard("通知关键词规则", "本地模式下匹配关键词自动记账", Icons.Default.Category, onOpenNotificationRuleManager) }
+        item { SettingCard("关键词白名单", "自定义消费相关关键词白名单", Icons.Default.Notifications, onShowWhitelistManager) }
+        item { SettingCard("AI 提示词", "自定义通知识别和页面识别的 AI 提示词", Icons.Default.Edit, onShowAiPromptEditor) }
+        item { SettingCard("模型调用统计", state.aiStats.ifBlank { "暂无调用记录" }, Icons.Default.BarChart, {}) }
+
+        // ===== 账本 =====
         item { SectionTitle("账本") }
-        // 月度周期起始日：按工资日算「本月」，影响统计、预算和报表
         item {
             var showPicker by remember { mutableStateOf(false) }
             SettingCard(
@@ -1851,19 +1916,50 @@ private fun SettingsScreen(
         }
         item { SettingCard("分类管理", "新增、重命名、换色或删除消费分类", Icons.Default.Category, onOpenCategoryManager) }
         item { SettingCard("导入账单", "选择微信、支付宝、京东、淘宝、抖音等 CSV/TXT/XLSX 账单", Icons.Default.FileUpload, onImportBills) }
-        item { SettingCard("导出 CSV", "生成本地账本文件，并通过系统分享面板保存或发送", Icons.Default.FileDownload, onExportCsv) }
-        item { SettingCard("通知规则库", "本地模式下自定义关键词规则匹配自动记账", Icons.Default.Category, onOpenNotificationRuleManager) }
-        item { SettingCard("白名单管理", "自定义消费相关关键词白名单", Icons.Default.Notifications, onShowWhitelistManager) }
-        item { SectionTitle("AI 记账") }
-        item { SettingCard("AI 记账设置", "${if (state.aiSettings.enabled) "已开启" else "已关闭"} · 配置API地址和模型", Icons.Default.Image, onOpenAiSettings) }
-        item { SettingCard("AI 提示词自定义", "自定义通知识别和页面识别的AI提示词", Icons.Default.Edit, onShowAiPromptEditor) }
-        item { SettingCard("模型调用统计", state.aiStats.ifBlank { "暂无调用记录" }, Icons.Default.BarChart, {}) }
+
+        // ===== 隐私与提醒 =====
+        item { SectionTitle("隐私与提醒") }
+        item {
+            Card(colors = CardDefaults.cardColors(containerColor = CardWhite), shape = RoundedCornerShape(14.dp), modifier = Modifier.fillMaxWidth()) {
+                Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Icon(Icons.Default.Delete, contentDescription = null, tint = Blue)
+                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text("记账成功自动删除截图", color = Ink, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            if (autoDeleteScreenshot) "开启：自动记账成功后自动删除相册原截图" else "关闭：保留相册截图",
+                            color = Muted, style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                    Switch(checked = autoDeleteScreenshot, onCheckedChange = onToggleAutoDeleteScreenshot)
+                }
+            }
+        }
+        item {
+            Card(colors = CardDefaults.cardColors(containerColor = CardWhite), shape = RoundedCornerShape(14.dp), modifier = Modifier.fillMaxWidth()) {
+                Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Icon(Icons.Default.MoreHoriz, contentDescription = null, tint = Blue)
+                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        Text("最近任务中隐藏", color = Ink, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            if (hideFromRecents) "开启：从多任务/最近任务列表隐藏本应用" else "关闭：在最近任务列表中显示本应用",
+                            color = Muted, style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                    Switch(checked = hideFromRecents, onCheckedChange = onToggleHideFromRecents)
+                }
+            }
+        }
+
+        // ===== 数据 =====
         item { SectionTitle("数据") }
-        item { SettingCard("导出数据", "将所有账单、分类、规则导出为JSON文件", Icons.Default.FileDownload, onExportBackup) }
-        item { SettingCard("导入数据", "从JSON备份文件恢复账单数据", Icons.Default.FileUpload, onImportBackupClick) }
+        item { SettingCard("导出数据", "将所有账单、分类、规则导出为 JSON 文件", Icons.Default.FileDownload, onExportBackup) }
+        item { SettingCard("导入数据", "从 JSON 备份文件恢复账单数据", Icons.Default.FileUpload, onImportBackupClick) }
+        item { SettingCard("导出 CSV", "生成本地账本文件，并通过系统分享面板保存或发送", Icons.Default.FileDownload, onExportCsv) }
         item { SettingCard("操作日志", "查看自动记账和系统操作记录", Icons.Default.ReceiptLong, onShowLogs) }
-        item { SettingCard("使用说明", "了解 AI 模式和本地模式的使用方式", Icons.Default.MoreHoriz, onShowUsageGuide) }
+
+        // ===== 关于 =====
         item { SectionTitle("关于") }
+        item { SettingCard("使用说明", "了解 AI 模式和本地模式的使用方式", Icons.Default.MoreHoriz, onShowUsageGuide) }
         item {
             val ctxVer = LocalContext.current
             val verName = remember { try { ctxVer.packageManager.getPackageInfo(ctxVer.packageName, 0).versionName ?: "" } catch (_: Exception) { "" } }
@@ -2623,6 +2719,34 @@ private fun SettingCard(title: String, body: String, icon: ImageVector, onClick:
 @Composable
 private fun SectionTitle(text: String) {
     Text(text, color = Ink, fontWeight = FontWeight.Bold, modifier = Modifier.padding(top = 4.dp))
+}
+
+/** 设置页顶部总览卡里的一行：emoji + 名称 + 右侧状态胶囊 */
+@Composable
+private fun OverviewRow(emoji: String, name: String, status: String, on: Boolean) {
+    Row(
+        Modifier.fillMaxWidth().padding(vertical = 5.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Text(emoji, style = MaterialTheme.typography.bodyMedium)
+        Text(
+            name,
+            color = Color.White,
+            fontWeight = FontWeight.Medium,
+            style = MaterialTheme.typography.bodyMedium,
+            modifier = Modifier.weight(1f)
+        )
+        Text(
+            status,
+            color = Color.White,
+            fontWeight = FontWeight.Bold,
+            style = MaterialTheme.typography.labelSmall,
+            modifier = Modifier
+                .background(Color.White.copy(alpha = if (on) 0.26f else 0.13f), RoundedCornerShape(9.dp))
+                .padding(horizontal = 9.dp, vertical = 3.dp)
+        )
+    }
 }
 
 @Composable

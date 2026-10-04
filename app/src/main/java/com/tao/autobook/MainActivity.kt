@@ -297,6 +297,7 @@ class MainActivity : ComponentActivity() {
             },
             currentVersionCode = myVersionCode,
             onCheckUpdate = { vm.checkUpdate(myVersionCode, manual = true) },
+            onToggleAi = { vm.setAiEnabled(it) },
         )
 
         // 更新提示弹窗

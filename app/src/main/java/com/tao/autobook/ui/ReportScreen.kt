@@ -25,9 +25,12 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.ArrowForward
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.Icon
@@ -37,6 +40,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -79,10 +83,15 @@ internal fun ReportScreen(
     onCustomRange: (LocalDate, LocalDate) -> Unit,
     onDrill: (String) -> Unit,
     onSaveBudget: (String, String) -> Unit,
+    onOpenTransaction: (Long) -> Unit = {},
 ) {
     var showCustomPicker by remember { mutableStateOf(false) }
     var budgetTarget by remember { mutableStateOf<Pair<String, String>?>(null) }
     var showBudgetManager by remember { mutableStateOf(false) }
+    // 趋势图默认只看柱状图，折线图折叠起来（同数据重复展示占屏）
+    var showLineChart by remember { mutableStateOf(false) }
+    // 翻页节流：动画进行中忽略连点，避免连发聚合查询
+    var paging by remember { mutableStateOf(false) }
 
     val snap = report.snapshot
     val typeLabel = report.type.label
@@ -95,9 +104,15 @@ internal fun ReportScreen(
         item {
             ReportHeader(
                 report = report,
+                paging = paging,
                 onPeriod = onPeriod,
                 onType = onType,
-                onShift = onShift,
+                onShift = { delta ->
+                    if (!paging) {
+                        paging = true
+                        onShift(delta)
+                    }
+                },
                 onOpenCustom = { showCustomPicker = true },
             )
         }
@@ -113,19 +128,54 @@ internal fun ReportScreen(
                 )
             }
         }
-        item { ReportTrendCard(report, accent) }
+        item {
+            ReportTrendCard(
+                report = report,
+                accent = accent,
+                showLine = showLineChart,
+                onToggleLine = { showLineChart = !showLineChart },
+            )
+        }
         item {
             CategoryCompositionCard(
                 report = report,
                 categories = categories,
                 onDrill = onDrill,
+                onOpenTransaction = onOpenTransaction,
             )
         }
         item { MerchantRankCard(report) }
         item { PaymentAppCard(report) }
         item { WeekdayCard(report, accent) }
-        if (snap.summary.cnt == 0) {
+        if (report.loading) {
+            item {
+                Row(
+                    Modifier.fillMaxWidth().padding(vertical = 4.dp),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(14.dp),
+                        strokeWidth = 2.dp,
+                        color = accent
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text("正在统计…", color = Muted, style = MaterialTheme.typography.labelSmall)
+                }
+            }
+        }
+        if (snap.summary.cnt == 0 && !report.loading) {
             item { ReportEmptyHint("当前区间没有${typeLabel}记录。换个周期或先记几笔试试。") }
+        }
+    }
+
+    // 翻页节流：数据加载完成后解除（loading 从 true → false）
+    LaunchedEffect(report.loading) {
+        if (report.loading) {
+            kotlinx.coroutines.delay(400)
+            paging = false
+        } else {
+            paging = false
         }
     }
 
@@ -168,6 +218,7 @@ internal fun ReportScreen(
 @Composable
 private fun ReportHeader(
     report: ReportUiState,
+    paging: Boolean = false,
     onPeriod: (ReportPeriod) -> Unit,
     onType: (TransactionType) -> Unit,
     onShift: (Long) -> Unit,
@@ -194,8 +245,8 @@ private fun ReportHeader(
                 Modifier.weight(1f).background(CardWhite, RoundedCornerShape(14.dp)).padding(horizontal = 4.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                IconButton(onClick = { onShift(-1L) }, enabled = report.pageable) {
-                    Icon(Icons.Default.ArrowBack, contentDescription = "上一期", tint = if (report.pageable) Ink else Line)
+                IconButton(onClick = { onShift(-1L) }, enabled = report.pageable && !paging) {
+                    Icon(Icons.Default.ArrowBack, contentDescription = "上一期", tint = if (report.pageable && !paging) Ink else Line)
                 }
                 Text(
                     report.rangeLabel,
@@ -205,8 +256,11 @@ private fun ReportHeader(
                     overflow = TextOverflow.Ellipsis,
                     modifier = Modifier.weight(1f)
                 )
-                IconButton(onClick = { onShift(1L) }, enabled = report.canGoNext) {
-                    Icon(Icons.Default.ArrowForward, contentDescription = "下一期", tint = if (report.canGoNext) Ink else Line)
+                if (paging) {
+                    Text("…", color = Blue, fontWeight = FontWeight.Bold, modifier = Modifier.padding(end = 6.dp))
+                }
+                IconButton(onClick = { onShift(1L) }, enabled = report.canGoNext && !paging) {
+                    Icon(Icons.Default.ArrowForward, contentDescription = "下一期", tint = if (report.canGoNext && !paging) Ink else Line)
                 }
             }
             Spacer(Modifier.width(8.dp))
@@ -268,6 +322,21 @@ private fun ReportOverviewCard(report: ReportUiState) {
                     Modifier.weight(1f),
                     valueColor = if (balance < 0) Red else FreshMint
                 )
+            }
+            // 收入模式下多一个"储蓄率"指标：本期收入减去同期支出，占收入的比例
+            if (report.type == TransactionType.INCOME && total > 0L) {
+                val saved = total - snap.counterTotal
+                val saveRate = saved * 100 / total
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    ReportMetric(
+                        "储蓄率",
+                        if (saveRate <= 0L) "0%" else "$saveRate%",
+                        Modifier.weight(1f),
+                        valueColor = if (saveRate > 0L) FreshMint else Red
+                    )
+                    ReportMetric("同期支出", formatMoney(snap.counterTotal), Modifier.weight(1f))
+                    ReportMetric("本期存下", formatMoney(saved), Modifier.weight(1f), valueColor = if (saved < 0) Red else FreshMint)
+                }
             }
             if (report.prevLabel.isNotEmpty()) {
                 Text(
@@ -473,7 +542,12 @@ private fun ProgressBar(ratio: Float, color: Color) {
 // ====== 趋势 ======
 
 @Composable
-private fun ReportTrendCard(report: ReportUiState, accent: Color) {
+private fun ReportTrendCard(
+    report: ReportUiState,
+    accent: Color,
+    showLine: Boolean = false,
+    onToggleLine: () -> Unit = {},
+) {
     // 年报/全部按月，其余按天
     val byMonth = report.period == ReportPeriod.Year ||
         report.period == ReportPeriod.All ||
@@ -481,9 +555,27 @@ private fun ReportTrendCard(report: ReportUiState, accent: Color) {
     val series = if (byMonth) monthSeries(report) else daySeries(report)
 
     ReportCard(if (byMonth) "月度趋势" else "每日趋势") {
-        ReportLineChart(series, accent)
-        Spacer(Modifier.height(4.dp))
         ReportBarChart(series, accent)
+        Spacer(Modifier.height(4.dp))
+        Row(
+            Modifier.fillMaxWidth().clickable { onToggleLine() },
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                if (showLine) "收起折线图" else "展开折线图",
+                color = Blue,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.weight(1f)
+            )
+            Icon(
+                if (showLine) Icons.Default.KeyboardArrowUp else Icons.Default.KeyboardArrowDown,
+                contentDescription = null,
+                tint = Blue
+            )
+        }
+        if (showLine) {
+            ReportLineChart(series, accent)
+        }
     }
 }
 
@@ -531,16 +623,22 @@ private fun CategoryCompositionCard(
     report: ReportUiState,
     categories: List<CategoryEntity>,
     onDrill: (String) -> Unit,
+    onOpenTransaction: (Long) -> Unit = {},
 ) {
     val rows = report.snapshot.categories
     val total = rows.sumOf { it.total }.coerceAtLeast(1L)
+    // 用分类自己的配色（CategoryEntity.color），不用 FreshPalette 轮询——颜色和账本/分类管理一致
+    val catMap = categories.associateBy { it.id }
+    val catColors = rows.map { row ->
+        catMap[row.categoryId]?.color?.let { Color(it.toInt()) } ?: FreshPalette[0]
+    }
     ReportCard("${report.type.label}分类构成") {
         if (rows.isEmpty()) {
             Text("暂无${report.type.label}数据", color = Muted)
             return@ReportCard
         }
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(16.dp)) {
-            ReportDonutChart(rows.map { it.total }, rows.indices.map { FreshPalette[it % FreshPalette.size] }, Modifier.size(130.dp))
+            ReportDonutChart(rows.map { it.total }, catColors, Modifier.size(130.dp))
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text("共 ${rows.size} 个分类", color = Muted, style = MaterialTheme.typography.labelSmall)
                 Text(formatMoney(total), color = Ink, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.titleMedium)
@@ -549,32 +647,34 @@ private fun CategoryCompositionCard(
         }
         Spacer(Modifier.height(4.dp))
         rows.forEachIndexed { index, row ->
-            val name = categories.firstOrNull { it.id == row.categoryId }?.name ?: "其他"
+            val name = catMap[row.categoryId]?.name ?: "其他"
+            val color = catColors[index]
             val pct = row.total * 100 / total
+            val pctText = if (pct == 0L && row.total > 0L) "<1%" else "$pct%"
             val expanded = report.drillCategoryId == row.categoryId
             Column(
                 Modifier.fillMaxWidth().clickable { onDrill(row.categoryId) }.padding(vertical = 5.dp),
                 verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Box(Modifier.size(8.dp).background(FreshPalette[index % FreshPalette.size], CircleShape))
+                    Box(Modifier.size(8.dp).background(color, CircleShape))
                     Spacer(Modifier.width(8.dp))
                     Text(name, color = Ink, maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
-                    Text("$pct%  ", color = Muted, style = MaterialTheme.typography.bodySmall)
+                    Text("$pctText  ", color = Muted, style = MaterialTheme.typography.bodySmall)
                     Text(formatMoney(row.total), color = Ink)
                 }
-                ProgressBar((row.total.toFloat() / total).coerceIn(0f, 1f), FreshPalette[index % FreshPalette.size])
+                ProgressBar((row.total.toFloat() / total).coerceIn(0f, 1f), color)
                 Text("${row.cnt} 笔 · 笔均 ${formatMoney(if (row.cnt > 0) row.total / row.cnt else 0L)}", color = Muted, style = MaterialTheme.typography.labelSmall)
             }
             if (expanded) {
-                DrillDownBlock(report)
+                DrillDownBlock(report, onOpenTransaction = onOpenTransaction)
             }
         }
     }
 }
 
 @Composable
-private fun DrillDownBlock(report: ReportUiState) {
+private fun DrillDownBlock(report: ReportUiState, onOpenTransaction: (Long) -> Unit = {}) {
     val drill = report.drill
     Column(
         Modifier.fillMaxWidth().background(Color(0xFFF7F9FC), RoundedCornerShape(12.dp)).padding(12.dp),
@@ -594,12 +694,15 @@ private fun DrillDownBlock(report: ReportUiState) {
             }
         }
         if (drill.transactions.isNotEmpty()) {
-            Text("大额账单", color = Ink, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodySmall)
+            Text("大额账单（点击查看详情）", color = Ink, fontWeight = FontWeight.Bold, style = MaterialTheme.typography.bodySmall)
             drill.transactions.take(5).forEach { tx ->
-                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                Row(
+                    Modifier.fillMaxWidth().clickable { onOpenTransaction(tx.id) }.padding(vertical = 2.dp),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
                     Text(
                         "${formatDate(tx.paidAt)} ${tx.merchantName.ifBlank { tx.note.ifBlank { "未命名" } }}",
-                        color = Ink,
+                        color = Blue,
                         maxLines = 1,
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier.weight(1f),
@@ -650,12 +753,14 @@ private fun PaymentAppCard(report: ReportUiState) {
         val total = rows.sumOf { it.total }.coerceAtLeast(1L)
         rows.forEachIndexed { index, row ->
             val label = runCatching { PaymentApp.valueOf(row.paymentApp).label }.getOrDefault(row.paymentApp)
+            val pct = row.total * 100 / total
+            val pctText = if (pct == 0L && row.total > 0L) "<1%" else "$pct%"
             Column(Modifier.fillMaxWidth().padding(vertical = 5.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                     Box(Modifier.size(8.dp).background(FreshPalette[index % FreshPalette.size], CircleShape))
                     Spacer(Modifier.width(8.dp))
                     Text(label, color = Ink, maxLines = 1, modifier = Modifier.weight(1f))
-                    Text("${row.total * 100 / total}%  ", color = Muted, style = MaterialTheme.typography.bodySmall)
+                    Text("$pctText  ", color = Muted, style = MaterialTheme.typography.bodySmall)
                     Text(formatMoney(row.total), color = Ink)
                 }
                 ProgressBar((row.total.toFloat() / total).coerceIn(0f, 1f), FreshPalette[index % FreshPalette.size])
@@ -713,6 +818,13 @@ private fun ReportLineChart(series: ChartSeries, color: Color) {
             }
             if (values.isEmpty() || values.all { it == 0L }) {
                 drawLine(Line, Offset(0f, size.height * 0.62f), Offset(size.width, size.height * 0.62f), strokeWidth = 2.dp.toPx(), cap = StrokeCap.Round)
+                return@Canvas
+            }
+            // 单点：画一个圆点居中，不画线
+            if (values.size == 1) {
+                val cx = size.width / 2f
+                val cy = size.height - (values[0] / maxValue) * size.height
+                drawCircle(color, 5.dp.toPx(), Offset(cx, cy))
                 return@Canvas
             }
             val stepX = size.width / max(1, values.size - 1)

@@ -430,6 +430,11 @@ class AutoBookRepository(
         aiSettingsStore.save(settings, apiKey)
     }
 
+    /** 只切 AI 总开关（设置页快捷开关），保留地址/模型/密钥 */
+    suspend fun setAiEnabled(enabled: Boolean) = withContext(Dispatchers.IO) {
+        aiSettingsStore.setEnabled(enabled)
+    }
+
     suspend fun testAiSettings(settings: AiRecognitionSettings, apiKey: String?): Result<Unit> = withContext(Dispatchers.IO) {
         val current = aiSettingsStore.loadConfig()
         val config = current.copy(

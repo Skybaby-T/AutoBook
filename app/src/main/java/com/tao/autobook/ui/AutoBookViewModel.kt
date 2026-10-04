@@ -437,6 +437,17 @@ class AutoBookViewModel(private val repository: AutoBookRepository) : ViewModel(
         }
     }
 
+    /** 只切 AI 总开关（设置页快捷开关），保留地址/模型/密钥 */
+    fun setAiEnabled(enabled: Boolean) {
+        viewModelScope.launch {
+            runCatching { repository.setAiEnabled(enabled) }
+                .onSuccess {
+                    message.value = if (enabled) "AI 智能识别已开启" else "AI 已关闭，改用本地规则识别"
+                }
+                .onFailure { message.value = it.message ?: "切换失败" }
+        }
+    }
+
     fun testAiSettings(settings: AiRecognitionSettings, apiKey: String?) {
         viewModelScope.launch {
             busy.value = true
