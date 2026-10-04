@@ -49,7 +49,7 @@ class MainActivity : ComponentActivity() {
             requestPermissions(arrayOf(Manifest.permission.READ_EXTERNAL_STORAGE), 20)
         }
         requestPermissions(arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION), 21)
-        try { startForegroundService(Intent(this, KeepAliveService::class.java)) } catch (_: Exception) {}
+        try { KeepAliveService.start(this) } catch (_: Exception) {}
         pendingTransactionId.value = intent.getLongExtra(AutoBookNotifier.EXTRA_TRANSACTION_ID, -1L).takeIf { it > 0 }
         setContent { AutoBookRoot() }
     }

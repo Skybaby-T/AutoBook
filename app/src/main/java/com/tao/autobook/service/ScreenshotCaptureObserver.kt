@@ -73,19 +73,13 @@ class ScreenshotCaptureObserver(
         }
         observer = obs
         try {
+            // 注：EXTERNAL_CONTENT_URI 与 getContentUri("external") 是同一个 URI，
+            // 只注册一次；注册两次会让每次截图触发两遍 onChange。
             context.contentResolver.registerContentObserver(
                 MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
                 true,
                 obs
             )
-            // 部分机型截图会先写到 internal/files 再同步 external
-            runCatching {
-                context.contentResolver.registerContentObserver(
-                    MediaStore.Images.Media.getContentUri("external"),
-                    true,
-                    obs
-                )
-            }
             Log.i(TAG, "截图监听已启动")
         } catch (e: Exception) {
             Log.e(TAG, "注册截图监听失败", e)
@@ -112,27 +106,28 @@ class ScreenshotCaptureObserver(
         pendingJob = appScope.launch {
             // 等系统写完文件；小米/HyperOS 截图常先 pending 再可见
             delay(PROCESS_DELAY_MS)
-            // size=0 时再多等一轮，避免读到 .pending 文件
-            val first = runCatching { processLatestScreenshot(uri) }
+            // 返回值 true = 已到终态（成功/跳过），false = 还没写完，值得再等一轮
+            val done = runCatching { processLatestScreenshot(uri) }
                 .onFailure { Log.e(TAG, "处理截图失败(第1次)", it) }
-            val ok = first.isSuccess
-            if (!ok) {
+                .getOrDefault(false)
+            if (!done) {
                 delay(RETRY_DELAY_MS)
                 runCatching { processLatestScreenshot(uri) }
                     .onFailure { Log.e(TAG, "处理截图失败(第2次)", it) }
-            } else {
-                // 即便成功返回，也可能是 size=0 跳过；再补扫一次
-                delay(RETRY_DELAY_MS)
-                runCatching { processLatestScreenshot(uri) }
             }
         }
     }
 
-    private suspend fun processLatestScreenshot(changedUri: Uri?) {
+    /**
+     * 处理最新候选截图。
+     * @return true = 已达终态（已记账 / 已识别待确认 / 判定为重复或非截图，无需再试）
+     *         false = 文件尚未写完（size=0 或查不到），调用方可稍后重试
+     */
+    private suspend fun processLatestScreenshot(changedUri: Uri?): Boolean {
         val image = findCandidateImage(changedUri)
         if (image == null) {
             Log.i(TAG, "未找到候选图片 uri=$changedUri")
-            return
+            return false
         }
         val key = image.id.toString()
         val now = System.currentTimeMillis()
@@ -140,7 +135,7 @@ class ScreenshotCaptureObserver(
         // 仅“成功处理过”才去重；失败不要占坑，否则会永远跳过
         if (last != null && last > 0 && now - last < DEDUPE_WINDOW_MS) {
             Log.i(TAG, "跳过重复: id=${image.id} name=${image.displayName}")
-            return
+            return true
         }
 
         Log.i(
@@ -150,27 +145,27 @@ class ScreenshotCaptureObserver(
 
         if (!looksLikeScreenshot(image)) {
             Log.i(TAG, "跳过非截图: ${image.displayName} / ${image.relativePath}")
-            return
+            return true
         }
         // 只处理最近几分钟内的新图，避免扫历史
         if (now - image.dateAddedMs > MAX_AGE_MS) {
             Log.i(TAG, "跳过旧图: ${image.displayName} age=${now - image.dateAddedMs}ms")
-            return
+            return true
         }
         // 仍 pending / size=0 时不要硬读，留给下一轮重试
         if (image.size == 0L) {
-            Log.i(TAG, "截图尚未写完(size=0)，跳过本轮: ${image.displayName}")
-            return
+            Log.i(TAG, "截图尚未写完(size=0)，等待重试: ${image.displayName}")
+            return false
         }
         if (image.size in 1 until MIN_IMAGE_BYTES) {
             Log.i(TAG, "跳过过小文件: ${image.displayName} size=${image.size}")
-            return
+            return true
         }
 
         val app = context.applicationContext as? AutoBookApplication
         if (app == null) {
             Log.e(TAG, "Application 为空，无法记账")
-            return
+            return true
         }
         Log.i(TAG, "检测到新截图，开始识别: ${image.displayName}")
         try {
@@ -209,6 +204,7 @@ class ScreenshotCaptureObserver(
             Log.e(TAG, "识别失败，保留重试机会: ${image.displayName}", e)
             throw e
         }
+        return true
     }
 
     private data class ImageInfo(
@@ -391,23 +387,10 @@ class ScreenshotCaptureObserver(
             }
         }
 
-        // 3) Android 11+ 用户确认删除（系统弹窗）
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            try {
-                val pi = MediaStore.createDeleteRequest(context.contentResolver, listOf(image.uri))
-                // 需要 Activity 启动，这里用 FLAG_ACTIVITY_NEW_TASK 尝试
-                val intent = Intent(Intent.ACTION_VIEW).apply {
-                    // createDeleteRequest 返回 PendingIntent，直接 send
-                }
-                pi.send()
-                Log.i(TAG, "已发起系统删除确认: ${image.displayName}")
-                return
-            } catch (e: Exception) {
-                Log.w(TAG, "createDeleteRequest 失败: ${e.message}")
-            }
-        }
-
-        Log.e(TAG, "无法删除原截图: ${image.displayName}，可能缺所有文件访问权限")
+        // 3) Android 11+ 系统确认删除弹窗
+        //    需要从 Activity 发起（startIntentSenderForResult），后台 Service 无法直接弹，
+        //    因此这里只在日志中记录失败原因，不再尝试无效的 PendingIntent.send()。
+        Log.w(TAG, "无法删除原截图: ${image.displayName}（MediaStore 与文件路径均失败，可能缺所有文件访问权限）")
     }
 
 

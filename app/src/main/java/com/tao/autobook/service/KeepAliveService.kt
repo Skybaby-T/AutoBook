@@ -1,22 +1,34 @@
 package com.tao.autobook.service
 
-import android.app.AlarmManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
-import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.os.IBinder
 import com.tao.autobook.MainActivity
 
+/**
+ * 前台保活服务。
+ *
+ * 存活策略：只依赖前台通知 + START_STICKY，由系统在内存回收后自动重建。
+ * 曾用 1 分钟 RTC_WAKEUP 闹钟"保活"，实测是空转耗电（开机 9 天唤醒 5163 次，
+ * 全机 Top1，而 onReceive 只重新调度自己、不做任何事），已移除。
+ * 如需更激进的保活，请优先考虑给用户引导"电池优化白名单"，而不是加闹钟。
+ */
 class KeepAliveService : Service() {
     companion object {
         private const val CHANNEL_ID = "autobook_keepalive"
         private const val NOTIFICATION_ID = 9999
-        private const val ALARM_INTERVAL = 60_000L
+
+        fun start(context: Context) {
+            try {
+                context.startForegroundService(Intent(context, KeepAliveService::class.java))
+            } catch (_: Exception) {
+            }
+        }
     }
 
     override fun onCreate() {
@@ -31,42 +43,28 @@ class KeepAliveService : Service() {
             )
             val notification = Notification.Builder(this, CHANNEL_ID)
                 .setContentTitle("SKY自动记账")
-                .setContentText("正在后台运行 · 点击打开")
-                .setSmallIcon(android.R.drawable.ic_menu_agenda)
+                .setContentText("正在后台运行 · 截图自动记账")
+                .setSmallIcon(com.tao.autobook.R.drawable.ic_launcher)
                 .setContentIntent(pendingIntent)
                 .setOngoing(true)
                 .build()
             startForeground(NOTIFICATION_ID, notification)
-            scheduleKeepAlive()
         } catch (e: Exception) {
             e.printStackTrace()
         }
-    }
-
-    private fun scheduleKeepAlive() {
-        val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        val intent = Intent(this, KeepAliveReceiver::class.java)
-        val pendingIntent = PendingIntent.getBroadcast(
-            this, 0, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-        alarmManager.setRepeating(
-            AlarmManager.RTC_WAKEUP,
-            System.currentTimeMillis() + ALARM_INTERVAL,
-            ALARM_INTERVAL,
-            pendingIntent
-        )
     }
 
     private fun createNotificationChannel() {
         val channel = NotificationChannel(
             CHANNEL_ID,
             "后台运行",
-            NotificationManager.IMPORTANCE_HIGH
+            NotificationManager.IMPORTANCE_LOW
         ).apply {
             description = "保持记账服务在后台运行"
-            setShowBadge(true)
+            setShowBadge(false)
             enableVibration(false)
-            lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+            setSound(null, null)
+            lockscreenVisibility = Notification.VISIBILITY_PRIVATE
         }
         val manager = getSystemService(NotificationManager::class.java)
         manager.createNotificationChannel(channel)
@@ -76,33 +74,5 @@ class KeepAliveService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         return START_STICKY
-    }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        val alarmManager = getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        val intent = Intent(this, KeepAliveReceiver::class.java)
-        val pendingIntent = PendingIntent.getBroadcast(
-            this, 0, intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-        alarmManager.cancel(pendingIntent)
-    }
-}
-
-class KeepAliveReceiver : BroadcastReceiver() {
-    override fun onReceive(context: Context, intent: Intent?) {
-        // 不在这里启动服务（会 ANR），只调度下一次 alarm
-        // 系统会通过 START_STICKY 自动重启服务
-        val alarmManager = context.getSystemService(Context.ALARM_SERVICE) as AlarmManager
-        val alarmIntent = Intent(context, KeepAliveReceiver::class.java)
-        val pendingIntent = PendingIntent.getBroadcast(
-            context, 0, alarmIntent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
-        )
-        alarmManager.setRepeating(
-            AlarmManager.RTC_WAKEUP,
-            System.currentTimeMillis() + 60_000L,
-            60_000L,
-            pendingIntent
-        )
     }
 }
