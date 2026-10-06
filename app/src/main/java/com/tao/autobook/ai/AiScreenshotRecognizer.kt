@@ -75,7 +75,9 @@ class AiScreenshotRecognizer {
                     .put("role", "user")
                     .put("content", "只回复 OK")))
                 .put("temperature", 0)
-                .put("max_tokens", 8)
+                // 推理模型（step-3.7-flash 等）关不掉推理，8 token 会被推理吃光导致误判失败；
+                // 512 实测可返回 OK，max_tokens 是上限不额外计费。
+                .put("max_tokens", 512)
                 .put("thinking", JSONObject().put("type", "disabled"))
             validateChatResponse(postJson(config, request))
         }.map { Unit }
@@ -148,10 +150,11 @@ class AiScreenshotRecognizer {
             .put("model", model)
             .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", content)))
             .put("temperature", 0)
-            // 视觉识别是"读图上已有文字"，不需要推理。截图 JSON 输出约 200 token，
-            // 但推理模型会先吐一大段 reasoning，波动 250~450 不等；给足 2048 避免推理把 content 挤空。
+            // 视觉识别是"读图上已有文字"，不需要推理。JSON 输出约 200 token，
+            // 但推理模型（如 step-3.7-flash）会先吐一大段 reasoning，实测波动 2000~4500 token；
+            // 给足 8192 兜底避免推理把 content 挤空（max_tokens=2048 时实测约 44% 概率被截断）。
             // max_tokens 是上限不是消耗，正常输出 200 就停，不额外计费。
-            .put("max_tokens", 2048)
+            .put("max_tokens", 8192)
             // 多写几种"关推理"参数，不同中转/模型认的字段不一样，命中一个即可把推理归零
             .put("thinking", JSONObject().put("type", "disabled"))
             .put("reasoning_effort", "none")
@@ -169,8 +172,11 @@ class AiScreenshotRecognizer {
             .put("model", model)
             .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", prompt)))
             .put("temperature", 0)
-            .put("max_tokens", 360)
+            // 推理模型（step-3.7-flash 等）推理约 1000~2000 token，360 会被吃光导致输出为空
+            .put("max_tokens", 2048)
             .put("thinking", JSONObject().put("type", "disabled"))
+            .put("reasoning_effort", "none")
+            .put("enable_thinking", false)
     }
 
     private fun buildDefaultNotificationPrompt(rawText: String): String {
@@ -203,8 +209,11 @@ class AiScreenshotRecognizer {
             .put("model", model)
             .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", prompt)))
             .put("temperature", 0)
-            .put("max_tokens", 360)
+            // 推理模型（step-3.7-flash 等）推理约 1000~2000 token，360 会被吃光导致输出为空
+            .put("max_tokens", 2048)
             .put("thinking", JSONObject().put("type", "disabled"))
+            .put("reasoning_effort", "none")
+            .put("enable_thinking", false)
     }
 
     private fun buildAccessibilityTextRequest(model: String, rawText: String): JSONObject {
@@ -225,7 +234,8 @@ class AiScreenshotRecognizer {
             .put("model", model)
             .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", prompt)))
             .put("temperature", 0)
-            .put("max_tokens", 480)
+            // 推理模型（step-3.7-flash 等）推理约 1000~2000 token，480 会被吃光导致输出为空
+            .put("max_tokens", 2048)
             .put("thinking", JSONObject().put("type", "disabled"))
     }
 
@@ -330,8 +340,10 @@ class AiScreenshotRecognizer {
             .put("model", model)
             .put("messages", JSONArray().put(JSONObject().put("role", "user").put("content", content)))
             .put("temperature", 0)
-            .put("max_tokens", 8)
+            // 推理模型（step-3.7-flash 等）关不掉推理，8 token 会被推理吃光导致验证误判失败
+            .put("max_tokens", 512)
             .put("thinking", JSONObject().put("type", "disabled"))
+            .put("reasoning_effort", "none")
     }
 
     private fun validateChatResponse(response: String) {
@@ -412,7 +424,8 @@ $truncated"""
                 .put("model", config.model)
                 .put("messages", org.json.JSONArray().put(org.json.JSONObject().put("role", "user").put("content", content)))
                 .put("temperature", 0)
-                .put("max_tokens", 4000)
+                // 推理模型（step-3.7-flash 等）会先吃 1000~2000 token 推理，CSV 数组本身也长，给足 8192
+                .put("max_tokens", 8192)
             val response = postJson(config, body)
             val jsonText = response.let { s -> val start = s.indexOf("["); val end = s.lastIndexOf("]"); if (start >= 0 && end > start) s.substring(start, end + 1) else s }
             val arr = org.json.JSONArray(jsonText)

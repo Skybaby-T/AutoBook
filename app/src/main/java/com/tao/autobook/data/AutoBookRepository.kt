@@ -1788,7 +1788,8 @@ $chatHistory
                     .put(org.json.JSONObject().put("role", "system").put("content", "你是智能记账助手，简洁回答，中文"))
                     .put(org.json.JSONObject().put("role", "user").put("content", userContent)))
                 .put("temperature", 0.3)
-                .put("max_tokens", 800)
+                // 推理模型（step-3.7-flash 等）推理会先吃 1000~2000 token，给足 4096 避免回复被截断
+                .put("max_tokens", 4096)
 
             val response = aiRecognizer.postJsonPublic(config, body)
             val content = org.json.JSONObject(response)
