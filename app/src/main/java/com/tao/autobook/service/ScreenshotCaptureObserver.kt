@@ -9,17 +9,13 @@ import android.os.Looper
 import android.provider.MediaStore
 import android.util.Log
 import java.io.File
-import android.content.ContentValues
-import android.content.Intent
-import android.provider.Settings
-import android.os.Environment
-import android.os.Build
 import com.tao.autobook.AutoBookApplication
 import com.tao.autobook.notify.AutoBookNotifier
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.concurrent.ConcurrentHashMap
@@ -31,8 +27,13 @@ import java.util.concurrent.ConcurrentHashMap
  * 1. App 进程存活，Application.onCreate 已 registerContentObserver
  * 2. MediaStore 图片库有新增/更新（系统截图入库）
  * 3. 文件名或路径像截图（Screenshot/截图/DCIM/Screenshots 等）
- * 4. 2 分钟内新图，且体积 >= 8KB
+ * 4. 5 分钟内新图，且体积 >= 8KB
  * 5. 同一图片 10 分钟内不重复处理
+ *
+ * 连续截图：所有候选图按 id 进入无界队列，由**单个 worker 串行消费**。
+ * 绝不在新截图到来时取消正在识别的上一张（旧实现 pendingJob.cancel() 会把
+ * 上一张的处理连根砍掉，导致连拍只记第一张/最后一张）。串行是刻意的：
+ * 去重合并逻辑依赖处理顺序，并发处理会产生重复账单。
  */
 class ScreenshotCaptureObserver(
     private val context: Context,
@@ -45,12 +46,27 @@ class ScreenshotCaptureObserver(
         private const val RETRY_DELAY_MS = 3500L
         private const val MIN_IMAGE_BYTES = 8 * 1024L
         private const val MAX_AGE_MS = 5 * 60 * 1000L
+
+        /** 单张图最多尝试次数（含首次），用于等待系统写完文件 */
+        private const val MAX_ATTEMPTS = 3
+
+        /** uri 无法定位到具体图片时，回扫最近多少张（连拍兜底） */
+        private const val FALLBACK_SCAN_LIMIT = 8
     }
 
     private val handler = Handler(Looper.getMainLooper())
-    private val processed = ConcurrentHashMap<String, Long>()
+
+    /** id -> 上次成功处理完成时间 */
+    private val processed = ConcurrentHashMap<Long, Long>()
+
+    /** 已在队列中等待处理的 id，避免同一张重复入队 */
+    private val queuedIds = ConcurrentHashMap.newKeySet<Long>()
+
+    /** 待处理图片 id 队列（无界，保证连拍不丢） */
+    private val pendingIds = Channel<Long>(Channel.UNLIMITED)
+
     private var observer: ContentObserver? = null
-    private var pendingJob: Job? = null
+    private var workerJob: Job? = null
     private var started = false
 
     fun start() {
@@ -84,7 +100,10 @@ class ScreenshotCaptureObserver(
         } catch (e: Exception) {
             Log.e(TAG, "注册截图监听失败", e)
             started = false
+            return
         }
+        // 单 worker 串行消费队列；只在 stop() 时取消
+        workerJob = appScope.launch { consumeLoop() }
     }
 
     fun stop() {
@@ -95,45 +114,109 @@ class ScreenshotCaptureObserver(
             }
         }
         observer = null
-        pendingJob?.cancel()
-        pendingJob = null
+        workerJob?.cancel()
+        workerJob = null
         started = false
     }
 
+    /**
+     * 有新图事件：把候选 id 入队即可，立刻返回。
+     * 不做 delay、不取消任何在跑的任务——真正的等待与重试在 worker 里。
+     */
     private fun scheduleScan(uri: Uri?) {
-        // 不立刻 cancel 掉正在识别的任务；只合并短时间内的扫库
-        pendingJob?.cancel()
-        pendingJob = appScope.launch {
-            // 等系统写完文件；小米/HyperOS 截图常先 pending 再可见
-            delay(PROCESS_DELAY_MS)
-            // 返回值 true = 已到终态（成功/跳过），false = 还没写完，值得再等一轮
-            val done = runCatching { processLatestScreenshot(uri) }
-                .onFailure { Log.e(TAG, "处理截图失败(第1次)", it) }
-                .getOrDefault(false)
-            if (!done) {
-                delay(RETRY_DELAY_MS)
-                runCatching { processLatestScreenshot(uri) }
-                    .onFailure { Log.e(TAG, "处理截图失败(第2次)", it) }
+        val ids = resolveChangedIds(uri)
+        if (ids.isEmpty()) {
+            Log.i(TAG, "未解析到候选图片 uri=$uri")
+            return
+        }
+        for (id in ids) enqueue(id)
+    }
+
+    /**
+     * 把 onChange 给的 uri 解析成一批图片 id。
+     * uri 常是目录级/媒体库级，此时回扫最近若干张，保证连拍全部进入队列。
+     */
+    private fun resolveChangedIds(uri: Uri?): List<Long> {
+        if (uri != null) {
+            val single = queryOne(uri)
+            if (single != null) return listOf(single.id)
+        }
+        return queryRecentImages(FALLBACK_SCAN_LIMIT).map { it.id }
+    }
+
+    private fun enqueue(id: Long) {
+        if (id <= 0) return
+        val now = System.currentTimeMillis()
+        val last = processed[id]
+        // 去重窗口内已成功处理过 → 直接跳过
+        if (last != null && now - last < DEDUPE_WINDOW_MS) {
+            Log.i(TAG, "跳过重复(已处理): id=$id")
+            return
+        }
+        if (queuedIds.add(id)) {
+            val sent = pendingIds.trySend(id)
+            if (sent.isFailure) {
+                queuedIds.remove(id)
+                Log.w(TAG, "入队失败 id=$id ${sent.exceptionOrNull()?.message}")
+            } else {
+                Log.i(TAG, "已入队 id=$id 待处理=${queuedIds.size}")
+            }
+        }
+    }
+
+    /** 单 worker：逐张处理，互不打断 */
+    private suspend fun consumeLoop() {
+        for (id in pendingIds) {
+            try {
+                var done = false
+                var attempt = 0
+                while (!done && attempt < MAX_ATTEMPTS) {
+                    attempt++
+                    // 首次尝试：只有文件可能还没写完时才等（小米/HyperOS 截图常先 pending 再可见）。
+                    // 连拍时后面的图早在队列里排过队，通常已就绪，跳过等待能显著加快整体进度。
+                    if (attempt == 1) {
+                        val ready = runCatching {
+                            context.contentResolver.query(
+                                ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id),
+                                arrayOf(MediaStore.Images.Media.SIZE), null, null, null
+                            )?.use { c -> c.moveToFirst() && c.getLong(0) > 0L } ?: false
+                        }.getOrDefault(false)
+                        if (!ready) delay(PROCESS_DELAY_MS)
+                    }
+                    done = runCatching { processImageId(id) }
+                        .onFailure { Log.e(TAG, "处理截图失败(id=$id 第${attempt}次)", it) }
+                        .getOrDefault(false)
+                    if (!done && attempt < MAX_ATTEMPTS) delay(RETRY_DELAY_MS)
+                }
+                if (!done) {
+                    Log.w(TAG, "放弃处理 id=$id（重试 ${MAX_ATTEMPTS} 次仍未就绪）")
+                }
+            } catch (_: Exception) {
+                // 单张失败不影响后续
+            } finally {
+                queuedIds.remove(id)
             }
         }
     }
 
     /**
-     * 处理最新候选截图。
+     * 处理指定 id 的截图。
      * @return true = 已达终态（已记账 / 已识别待确认 / 判定为重复或非截图，无需再试）
-     *         false = 文件尚未写完（size=0 或查不到），调用方可稍后重试
+     *         false = 文件尚未写完（size=0 或查不到），调用方稍后重试
      */
-    private suspend fun processLatestScreenshot(changedUri: Uri?): Boolean {
-        val image = findCandidateImage(changedUri)
+    private suspend fun processImageId(id: Long): Boolean {
+        val uri = ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
+        val image = queryOne(uri)
         if (image == null) {
-            Log.i(TAG, "未找到候选图片 uri=$changedUri")
+            // 记录可能已删/尚未可见，交给上层重试；重试用尽即放弃
+            Log.i(TAG, "图片暂不可见 id=$id")
             return false
         }
-        val key = image.id.toString()
+        val key = image.id
         val now = System.currentTimeMillis()
         val last = processed[key]
         // 仅“成功处理过”才去重；失败不要占坑，否则会永远跳过
-        if (last != null && last > 0 && now - last < DEDUPE_WINDOW_MS) {
+        if (last != null && now - last < DEDUPE_WINDOW_MS) {
             Log.i(TAG, "跳过重复: id=${image.id} name=${image.displayName}")
             return true
         }
@@ -168,41 +251,33 @@ class ScreenshotCaptureObserver(
             return true
         }
         Log.i(TAG, "检测到新截图，开始识别: ${image.displayName}")
-        try {
-            val result = app.repository.importScreenshot(
-                uri = image.uri,
-                displayName = image.displayName,
-                capturedAtMs = image.dateAddedMs
-            )
-            processed[key] = now
-            if (processed.size > 100) {
-                processed.entries.removeIf { now - it.value > DEDUPE_WINDOW_MS }
-            }
-            val screenshot = app.getDao().getScreenshot(result)
-            val txId = screenshot?.parsedTransactionId
-            if (txId != null && txId > 0) {
-                val tx = app.getDao().getTransaction(txId)
-                if (tx != null) {
-                    AutoBookNotifier.notifyTransaction(context, tx, app.getDao().getCategories())
-                    app.repository.addLog(
-                        "截图监听",
-                        "自动记账成功",
-                        "${tx.merchantName} ¥${tx.amountCents / 100.0} [${tx.paymentApp.label}]"
-                    )
-                    Log.i(TAG, "自动记账成功 #${tx.id} ${tx.merchantName} ${tx.paymentApp.label}")
-                    // 如果用户开启了「自动删除截图」，删除相册原图
-                    if (app.repository.isAutoDeleteScreenshotEnabled()) {
-                        deleteAlbumScreenshot(image)
-                    }
+        val result = app.repository.importScreenshot(
+            uri = image.uri,
+            displayName = image.displayName,
+            capturedAtMs = image.dateAddedMs
+        )
+        processed[key] = System.currentTimeMillis()
+        if (processed.size > 200) {
+            val cutoff = System.currentTimeMillis() - DEDUPE_WINDOW_MS
+            processed.entries.removeIf { it.value < cutoff }
+        }
+        val screenshot = app.getDao().getScreenshot(result)
+        val txId = screenshot?.parsedTransactionId
+        if (txId != null && txId > 0) {
+            val tx = app.getDao().getTransaction(txId)
+            if (tx != null) {
+                AutoBookNotifier.notifyTransaction(context, tx, app.getDao().getCategories())
+                // 操作日志由仓库层统一写（截图补记 / 截图合并），这里只负责通知，
+                // 否则同一张截图会出现两条几乎相同的记录。
+                Log.i(TAG, "自动记账成功 #${tx.id} ${tx.merchantName} ${tx.paymentApp.label}")
+                // 如果用户开启了「自动删除截图」，删除相册原图
+                if (app.repository.isAutoDeleteScreenshotEnabled()) {
+                    deleteAlbumScreenshot(image)
                 }
-            } else {
-                app.repository.addLog("截图监听", "已识别待确认", image.displayName)
-                Log.i(TAG, "已识别待确认: ${image.displayName}")
             }
-        } catch (e: Exception) {
-            // 失败不写 processed，允许后续 onChange / 重试
-            Log.e(TAG, "识别失败，保留重试机会: ${image.displayName}", e)
-            throw e
+        } else {
+            // 同上：待确认日志由仓库层写，这里不再重复写一条
+            Log.i(TAG, "已识别待确认: ${image.displayName}")
         }
         return true
     }
@@ -216,17 +291,8 @@ class ScreenshotCaptureObserver(
         val size: Long
     )
 
-    private fun findCandidateImage(changedUri: Uri?): ImageInfo? {
-        // 1) 优先解析 onChange 给的具体 uri
-        if (changedUri != null) {
-            queryOne(changedUri)?.let { return it }
-            // 有的机型给的是目录级 uri，再查最新
-        }
-        // 2) 回退：查最新图片
-        return queryLatestImage()
-    }
-
-    private fun queryLatestImage(): ImageInfo? {
+    /** 回扫最近若干张图片（连拍兜底），按加入时间倒序 */
+    private fun queryRecentImages(limit: Int): List<ImageInfo> {
         val projection = arrayOf(
             MediaStore.Images.Media._ID,
             MediaStore.Images.Media.DISPLAY_NAME,
@@ -243,18 +309,18 @@ class ScreenshotCaptureObserver(
                 null,
                 "${MediaStore.Images.Media.DATE_ADDED} DESC"
             )?.use { cursor ->
-                if (!cursor.moveToFirst()) {
-                    Log.i(TAG, "MediaStore 查询为空（可能是部分相册权限）")
-                    return null
+                val out = ArrayList<ImageInfo>(limit)
+                while (cursor.moveToNext() && out.size < limit) {
+                    readImageInfo(cursor, null)?.let { out.add(it) }
                 }
-                readImageInfo(cursor, null)
-            }
+                out
+            } ?: emptyList()
         } catch (e: SecurityException) {
             Log.e(TAG, "MediaStore 无权限", e)
-            null
+            emptyList()
         } catch (e: Exception) {
-            Log.e(TAG, "queryLatestImage failed", e)
-            null
+            Log.e(TAG, "queryRecentImages failed", e)
+            emptyList()
         }
     }
 
@@ -268,7 +334,6 @@ class ScreenshotCaptureObserver(
             MediaStore.Images.Media.SIZE
         )
         return try {
-            // 若 uri 是数字 id 的 media item
             context.contentResolver.query(uri, projection, null, null, null)?.use { cursor ->
                 if (!cursor.moveToFirst()) return null
                 readImageInfo(cursor, uri)
@@ -325,6 +390,7 @@ class ScreenshotCaptureObserver(
             path.contains("截图") ||
             path.contains("dcim/screenshot")
     }
+
     /**
      * 删除相册原截图。
      * Android 10+ 对非本 App 写入的媒体默认不能 contentResolver.delete，
@@ -392,6 +458,4 @@ class ScreenshotCaptureObserver(
         //    因此这里只在日志中记录失败原因，不再尝试无效的 PendingIntent.send()。
         Log.w(TAG, "无法删除原截图: ${image.displayName}（MediaStore 与文件路径均失败，可能缺所有文件访问权限）")
     }
-
-
 }

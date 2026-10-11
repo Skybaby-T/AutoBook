@@ -837,6 +837,10 @@ class AutoBookRepository(
         return id > 0
     }
 
+    /** 把诊断备注折进唯一的日志 detail，避免同一张截图产出多条记录 */
+    private fun joinDetail(base: String, note: String): String =
+        if (note.isBlank()) base else "$base · $note"
+
     private suspend fun createScreenshotRecord(
             path: String,
             source: ScreenshotSourceType,
@@ -871,15 +875,19 @@ class AutoBookRepository(
             }
             val ai = aiAttempt?.getOrNull()
             val aiError = aiAttempt?.exceptionOrNull()?.message
-            if (!aiError.isNullOrBlank()) {
-                addLog("截图补记", "AI识别失败，本地OCR兜底", aiError.take(180))
-            } else if (ai != null && !ai.canAutoImport()) {
-                val reason = listOfNotNull(
-                    ai.reason.takeIf { it.isNotBlank() },
-                    ai.amountCents?.let { "¥${it / 100.0}" },
-                    "confidence=${ai.confidence}"
-                ).joinToString(" / ")
-                addLog("截图补记", "AI识别不确定，本地OCR兜底", reason.take(180))
+            // 诊断信息不单独写日志（否则同一张截图会产出多条记录），
+            // 折进下面唯一一条结果日志的 detail 里。
+            val aiNote: String = when {
+                !aiError.isNullOrBlank() -> "AI失败：" + aiError.take(120)
+                ai != null && !ai.canAutoImport() -> {
+                    val reason = listOfNotNull(
+                        ai.reason.takeIf { it.isNotBlank() },
+                        ai.amountCents?.let { "¥${it / 100.0}" },
+                        "confidence=${ai.confidence}"
+                    ).joinToString(" / ")
+                    "AI不确定：" + reason.take(120)
+                }
+                else -> ""
             }
 
             val storedText = combineOcrAndAi(enrichedOcr, ai, aiError)
@@ -904,7 +912,7 @@ class AutoBookRepository(
 
             // 本地先拦聊天/非支付截图，避免“我已经付款了”这类会话误入账
             if (looksLikeChatOrNonPaymentScreenshot(enrichedOcr, ai)) {
-                addLog("截图补记", "非支付截图，跳过自动入账", enrichedOcr.take(80))
+                addLog("截图补记", "非支付截图，跳过自动入账", joinDetail(enrichedOcr.take(80), aiNote))
                 return screenshotId to CaptureResult(null, false)
             }
 
@@ -951,13 +959,15 @@ class AutoBookRepository(
                     addLog(
                         "截图补记",
                         "自动记账成功",
-                        "${parsed.merchantName} ¥${parsed.amountCents / 100.0} [${parsed.paymentApp.label}]"
+                        joinDetail("${parsed.merchantName} ¥${parsed.amountCents / 100.0} [${parsed.paymentApp.label}]", aiNote)
                     )
-                } else if (result.transaction != null) {
-                    addLog("截图合并", "已合并到已有账单并补充凭证", "#${result.transaction.id} ${result.transaction.merchantName}")
+                } else if (result.transaction == null) {
+                    addLog("截图补记", "已识别待确认", joinDetail(displayName.orEmpty(), aiNote))
                 }
+                // 合并进已有账单的情况由 mergeIntoExistingTransaction 自己写日志，这里不重复写
                 return screenshotId to result
             }
+            addLog("截图补记", "已识别待确认", joinDetail(displayName.orEmpty(), aiNote))
             return screenshotId to CaptureResult(null, false)
         }
 
@@ -1166,7 +1176,8 @@ class AutoBookRepository(
             lastResult = result
             val err = result.exceptionOrNull()?.message?.take(80) ?: "未知"
             if (attempt < 2) {
-                addLog("截图补记", "AI识别失败(${attempt + 1}/3)，1.5秒后重试", err)
+                // 只进 logcat，不进操作日志：重试诊断会写多条，同一张截图应只留一条结果记录
+                android.util.Log.d(TAG, "AI识别失败(${attempt + 1}/3)，1.5秒后重试: $err")
                 kotlinx.coroutines.delay(1500L)
             }
         }

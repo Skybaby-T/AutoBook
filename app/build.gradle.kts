@@ -16,8 +16,8 @@ android {
         applicationId = "com.tao.autobook"
         minSdk = 31
         targetSdk = 36
-        versionCode = 44
-                        versionName = "1.0.43"
+        versionCode = 46
+                        versionName = "1.0.45"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
